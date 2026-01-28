@@ -1,10 +1,10 @@
 **File Structure**
-/
-├── etc/
-│   ├── cdr-cleanup.conf              # Main config
-│   ├── logrotate.d/
-│   │   └── cdr-cleanup               # Logrotate config
-│   └── systemd/system/
+>/
+>├── etc/
+>│   ├── cdr-cleanup.conf              # Main config
+>│   ├── logrotate.d/
+>│   │   └── cdr-cleanup               # Logrotate config
+>│   └── systemd/system/
 │       ├── cdr-cleanup.service       # Systemd service
 │       └── cdr-cleanup.timer         # Systemd timer
 ├── usr/
