@@ -1,0 +1,17 @@
+/var/log/cdr-cleanup/cdr-cleanup.log {
+    monthly                    # Rotate monthly
+    rotate 12                  # Keep 12 months of logs
+    size 50M                   # Rotate if file exceeds 50MB
+    compress                   # Compress rotated logs
+    delaycompress              # Delay compression until next rotation
+    missingok                  # Don't error if log is missing
+    notifempty                 # Don't rotate empty logs
+    create 640 root root       # Set permissions on new log file
+    dateext                    # Add date extension to rotated logs
+    dateformat -%Y%m%d        # Format: cdr-cleanup.log-20240127
+    sharedscripts              # Run postrotate script once for all logs
+    postrotate
+        # Optional: Notify script that rotation occurred
+        echo "[$(date '+%F %T')] [INFO] Logrotate executed rotation" >> /var/log/cdr-cleanup/cdr-cleanup.log 2>/dev/null || true
+    endscript
+}
