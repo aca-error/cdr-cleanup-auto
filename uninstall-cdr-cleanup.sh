@@ -265,4 +265,308 @@ remove_test_script() {
         rm -f "$TEST_SCRIPT"
         print_success "Removed test script: $TEST_SCRIPT"
     else
-        print_warning "
+        print_warning "Test script not found: $TEST_SCRIPT"
+    fi
+}
+
+remove_log_files() {
+    local delete_logs=${1:-0}
+    
+    print_info "Managing log files..."
+    
+    if [[ "$delete_logs" -eq 1 ]]; then
+        # Delete entire log directory
+        if [[ -d "$LOG_DIR" ]]; then
+            # Backup logs before deletion
+            local backup_dir="/tmp/cdr-cleanup-logs-backup-$(date +%Y%m%d_%H%M%S)"
+            mkdir -p "$backup_dir"
+            cp -r "$LOG_DIR"/* "$backup_dir" 2>/dev/null || true
+            print_info "Backed up logs to: $backup_dir"
+            
+            rm -rf "$LOG_DIR"
+            print_success "Removed log directory: $LOG_DIR"
+        else
+            print_warning "Log directory not found: $LOG_DIR"
+        fi
+    else
+        # Just remove current log file, keep directory
+        if [[ -f "$LOG_DIR/cdr-cleanup.log" ]]; then
+            rm -f "$LOG_DIR/cdr-cleanup.log"
+            print_success "Removed main log file: $LOG_DIR/cdr-cleanup.log"
+        fi
+        
+        # Remove rotated log files but keep directory
+        if [[ -d "$LOG_DIR" ]]; then
+            rm -f "$LOG_DIR"/*.gz 2>/dev/null || true
+            rm -f "$LOG_DIR"/cdr-cleanup.log-* 2>/dev/null || true
+            print_success "Cleaned up rotated log files"
+        fi
+    fi
+}
+
+cleanup_temporary_files() {
+    print_info "Cleaning up temporary files..."
+    
+    # Remove temporary files from /tmp and /var/tmp
+    rm -f /tmp/cdr_cleanup_* 2>/dev/null || true
+    rm -f /var/tmp/cdr_cleanup_* 2>/dev/null || true
+    rm -f /tmp/cdr-cleanup-* 2>/dev/null || true
+    
+    print_success "Temporary files cleaned up"
+}
+
+check_remaining_files() {
+    print_info "Checking for remaining files..."
+    
+    local remaining_files=()
+    
+    # Check each file/directory
+    [[ -f "$INSTALLED_SCRIPT" ]] && remaining_files+=("$INSTALLED_SCRIPT")
+    [[ -f "$CONFIG_FILE" ]] && remaining_files+=("$CONFIG_FILE")
+    [[ "${DELETE_MAN_PAGE:-1}" -eq 1 ]] && [[ -f "$MAN_PAGE" ]] && remaining_files+=("$MAN_PAGE")
+    [[ "${DELETE_MAN_PAGE:-1}" -eq 1 ]] && [[ -f "$MAN_PAGE_UNCOMPRESSED" ]] && remaining_files+=("$MAN_PAGE_UNCOMPRESSED")
+    [[ -f "$LOGROTATE_CONFIG" ]] && remaining_files+=("$LOGROTATE_CONFIG")
+    [[ -f "$SYSTEMD_SERVICE" ]] && remaining_files+=("$SYSTEMD_SERVICE")
+    [[ -f "$SYSTEMD_TIMER" ]] && remaining_files+=("$SYSTEMD_TIMER")
+    [[ -f "$CRON_FILE" ]] && remaining_files+=("$CRON_FILE")
+    [[ -f "$TEST_SCRIPT" ]] && remaining_files+=("$TEST_SCRIPT")
+    [[ -f "$LOCK_FILE" ]] && remaining_files+=("$LOCK_FILE")
+    
+    # Check log directory based on DELETE_LOGS flag
+    if [[ "${DELETE_LOGS:-0}" -eq 0 ]] && [[ -d "$LOG_DIR" ]]; then
+        # Check if directory is empty
+        if [[ -n "$(ls -A "$LOG_DIR" 2>/dev/null)" ]]; then
+            remaining_files+=("$LOG_DIR (contains files)")
+        fi
+    elif [[ "${DELETE_LOGS:-0}" -eq 1 ]] && [[ -d "$LOG_DIR" ]]; then
+        remaining_files+=("$LOG_DIR")
+    fi
+    
+    if [[ ${#remaining_files[@]} -gt 0 ]]; then
+        print_warning "The following files/directories remain:"
+        for file in "${remaining_files[@]}"; do
+            echo "  • $file"
+        done
+        
+        echo
+        read -p "Force remove these files? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            for file in "${remaining_files[@]}"; do
+                if [[ "$file" == *"("*")"* ]]; then
+                    # Extract path from parentheses
+                    local path="${file%% (*}"
+                    if [[ -d "$path" ]]; then
+                        rm -rf "$path"
+                        print_info "Force removed: $path"
+                    fi
+                else
+                    rm -rf "$file" 2>/dev/null || true
+                    print_info "Force removed: $file"
+                fi
+            done
+            
+            # Update man database if man page was removed
+            if [[ "${DELETE_MAN_PAGE:-1}" -eq 1 ]] && command -v mandb >/dev/null 2>&1; then
+                mandb 2>/dev/null || true
+                print_info "Updated man database after force removal"
+            fi
+        fi
+    else
+        print_success "All files removed successfully"
+    fi
+}
+
+show_preserved_directories() {
+    print_info "The following directories were preserved:"
+    
+    if [[ -d "$BACKUP_DIR" ]]; then
+        echo "  • $BACKUP_DIR"
+        echo "    Contents: $(find "$BACKUP_DIR" -type f 2>/dev/null | wc -l) files"
+        echo "    Size: $(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1 || echo "N/A")"
+    fi
+    
+    if [[ -d "$TARGET_DIR" ]]; then
+        echo "  • $TARGET_DIR"
+        echo "    Contents: $(find "$TARGET_DIR" -type f 2>/dev/null | wc -l) files"
+        echo "    Size: $(du -sh "$TARGET_DIR" 2>/dev/null | cut -f1 || echo "N/A")"
+    fi
+    
+    if [[ "${DELETE_LOGS:-0}" -eq 0 ]] && [[ -d "$LOG_DIR" ]]; then
+        echo "  • $LOG_DIR (empty directory preserved)"
+    fi
+    
+    if [[ "${DELETE_MAN_PAGE:-1}" -eq 0 ]] && [[ -f "$MAN_PAGE" ]]; then
+        echo "  • $MAN_PAGE (man page preserved)"
+    fi
+    
+    echo
+    echo "You may want to manually check these directories."
+}
+
+verify_uninstallation() {
+    print_info "Verifying uninstallation..."
+    
+    local verification_passed=true
+    
+    # Check main components
+    if [[ -f "$INSTALLED_SCRIPT" ]]; then
+        print_error "Main script still exists: $INSTALLED_SCRIPT"
+        verification_passed=false
+    fi
+    
+    if [[ -f "$CONFIG_FILE" ]]; then
+        print_error "Config file still exists: $CONFIG_FILE"
+        verification_passed=false
+    fi
+    
+    # Check man page if deletion was requested
+    if [[ "${DELETE_MAN_PAGE:-1}" -eq 1 ]] && [[ -f "$MAN_PAGE" ]]; then
+        print_error "Man page still exists: $MAN_PAGE"
+        verification_passed=false
+    fi
+    
+    if [[ -f "$SYSTEMD_SERVICE" ]]; then
+        print_error "Systemd service still exists: $SYSTEMD_SERVICE"
+        verification_passed=false
+    fi
+    
+    if [[ -f "$SYSTEMD_TIMER" ]]; then
+        print_error "Systemd timer still exists: $SYSTEMD_TIMER"
+        verification_passed=false
+    fi
+    
+    if [[ -f "$CRON_FILE" ]]; then
+        print_error "Cron file still exists: $CRON_FILE"
+        verification_passed=false
+    fi
+    
+    # Check if services are still active
+    if systemctl is-active --quiet cdr-cleanup.timer 2>/dev/null; then
+        print_error "Systemd timer is still active"
+        verification_passed=false
+    fi
+    
+    if pgrep -f "cdr-cleanup" >/dev/null 2>&1; then
+        print_error "cdr-cleanup process is still running"
+        verification_passed=false
+    fi
+    
+    if [[ "$verification_passed" == true ]]; then
+        print_success "Uninstallation verification passed!"
+        return 0
+    else
+        print_error "Uninstallation verification failed!"
+        return 1
+    fi
+}
+
+show_summary() {
+    echo
+    echo "========================================="
+    echo "CDR CLEANUP UNINSTALLATION SUMMARY"
+    echo "========================================="
+    echo
+    echo "Removed:"
+    [[ ! -f "$INSTALLED_SCRIPT" ]] && echo "  ✓ Main script"
+    [[ ! -f "$CONFIG_FILE" ]] && echo "  ✓ Config file"
+    [[ "${DELETE_MAN_PAGE:-1}" -eq 1 ]] && [[ ! -f "$MAN_PAGE" ]] && echo "  ✓ Man page"
+    [[ ! -f "$LOGROTATE_CONFIG" ]] && echo "  ✓ Logrotate config"
+    [[ ! -f "$SYSTEMD_SERVICE" ]] && echo "  ✓ Systemd service"
+    [[ ! -f "$SYSTEMD_TIMER" ]] && echo "  ✓ Systemd timer"
+    [[ ! -f "$CRON_FILE" ]] && echo "  ✓ Cron job"
+    [[ ! -f "$TEST_SCRIPT" ]] && echo "  ✓ Test script"
+    [[ ! -f "$LOCK_FILE" ]] && echo "  ✓ Lock file"
+    
+    if [[ "${DELETE_LOGS:-0}" -eq 1 ]]; then
+        [[ ! -d "$LOG_DIR" ]] && echo "  ✓ Log directory (all logs)"
+    else
+        [[ ! -f "$LOG_DIR/cdr-cleanup.log" ]] && echo "  ✓ Current log file"
+        echo "  ✓ Rotated log files"
+    fi
+    
+    echo
+    echo "Preserved (not removed):"
+    [[ -d "$BACKUP_DIR" ]] && echo "  • Backup directory: $BACKUP_DIR"
+    [[ -d "$TARGET_DIR" ]] && echo "  • Target directory: $TARGET_DIR"
+    
+    if [[ "${DELETE_LOGS:-0}" -eq 0 ]] && [[ -d "$LOG_DIR" ]]; then
+        echo "  • Log directory structure: $LOG_DIR"
+    fi
+    
+    if [[ "${DELETE_MAN_PAGE:-1}" -eq 0 ]] && [[ -f "$MAN_PAGE" ]]; then
+        echo "  • Man page: $MAN_PAGE"
+    fi
+    
+    echo
+    echo "Backups created:"
+    if ls /tmp/cdr-cleanup-*-backup-* 2>/dev/null | head -1 >/dev/null; then
+        ls -la /tmp/cdr-cleanup-*-backup-* 2>/dev/null | while read -r line; do
+            echo "  • $(echo "$line" | awk '{print $9}')"
+        done
+        echo
+        echo "Note: Backup files are in /tmp and may be cleaned on reboot."
+    else
+        echo "  • No backups created"
+    fi
+    
+    echo
+    echo "Next steps:"
+    echo "  1. Review preserved directories above"
+    echo "  2. Remove backup files from /tmp if no longer needed"
+    echo "  3. Reboot if any processes were still running"
+    echo "  4. Run 'systemctl daemon-reload' if systemd issues persist"
+    echo "  5. Run 'mandb' to update man database if man page was removed"
+    echo
+    echo "To reinstall, run the installation script again."
+    echo "========================================="
+}
+
+main() {
+    # Check if running as root
+    check_root
+    
+    # Confirm uninstallation
+    confirm_uninstall
+    
+    # Stop services and processes
+    stop_services
+    
+    # Remove files
+    remove_main_script
+    remove_config_files
+    
+    # Remove man page based on user choice
+    remove_man_page "${DELETE_MAN_PAGE:-1}"
+    
+    remove_systemd_files
+    remove_cron_job
+    remove_test_script
+    
+    # Handle log files based on user choice
+    remove_log_files "${DELETE_LOGS:-0}"
+    
+    # Cleanup temporary files
+    cleanup_temporary_files
+    
+    # Check for remaining files
+    check_remaining_files
+    
+    # Show preserved directories
+    show_preserved_directories
+    
+    # Verify uninstallation
+    if verify_uninstallation; then
+        print_success "Uninstallation completed successfully!"
+    else
+        print_warning "Uninstallation completed with warnings"
+    fi
+    
+    # Show summary
+    show_summary
+}
+
+# Run main function
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
