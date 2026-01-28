@@ -97,7 +97,7 @@ create_directories() {
     
     # Set permissions
     chmod 755 /var/log/cdr-cleanup
-    chmod 755 /home/cdrsbx
+    chmod 700 /home/cdrsbx
     chmod 700 /home/backup/deleted_files
     
     print_success "Directories created and permissions set"
