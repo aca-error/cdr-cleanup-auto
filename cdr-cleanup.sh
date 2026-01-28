@@ -7,15 +7,17 @@ set -o nounset -o pipefail -o errexit
 CONFIG_FILE="/etc/cdr-cleanup.conf"
 LOG_FILE="/var/log/cdr-cleanup/cdr-cleanup.log"
 LOCK_FILE="/var/lock/cdr-cleanup.lock"
+LOG_ROTATE_CONFIG="/etc/logrotate.d/cdr-cleanup"
 
 # Default values (akan di-override oleh config file)
 DIRECTORY="/home/cdrsbx"
 THRESHOLD=90
-MAX_LOG_SIZE=10485760        # 10MB
+MAX_LOG_SIZE_MB=50           # 50MB (sinkron dengan logrotate config)
 MIN_FILE_COUNT=30            # Minimal file disisakan per directory
 MAX_DELETE_PER_RUN=100       # Max file dihapus per eksekusi
 BACKUP_ENABLED=0
 BACKUP_DIR="/home/backup/deleted_files"
+AUTO_ROTATE_LOG=1            # Enable auto log rotation
 
 DRY_RUN=1
 DEBUG_MODE=0
@@ -136,6 +138,16 @@ load_config() {
             print_to_terminal "Warning: BACKUP_DIR not set in config, using default" "WARNING"
             BACKUP_DIR="/home/backup/deleted_files"
         fi
+        
+        if [[ -z "${MAX_LOG_SIZE_MB:-}" ]] || ! [[ "$MAX_LOG_SIZE_MB" =~ ^[0-9]+$ ]]; then
+            print_to_terminal "Warning: Invalid MAX_LOG_SIZE_MB in config, using default 50" "WARNING"
+            MAX_LOG_SIZE_MB=50
+        fi
+        
+        if [[ -z "${AUTO_ROTATE_LOG:-}" ]] || ! [[ "$AUTO_ROTATE_LOG" =~ ^[0-1]$ ]]; then
+            print_to_terminal "Warning: Invalid AUTO_ROTATE_LOG in config, using default 1" "WARNING"
+            AUTO_ROTATE_LOG=1
+        fi
     else
         print_to_terminal "Config file $CONFIG_FILE not found, using default values" "INFO"
     fi
@@ -147,7 +159,8 @@ load_config() {
     print_to_terminal "  Min Files/Dir: $MIN_FILE_COUNT" "INFO"
     print_to_terminal "  Max Delete/Run: $MAX_DELETE_PER_RUN" "INFO"
     print_to_terminal "  Backup Enabled: $([ "$BACKUP_ENABLED" -eq 1 ] && echo "YES ($BACKUP_DIR)" || echo "NO")" "INFO"
-    print_to_terminal "  Log File: $LOG_FILE" "INFO"
+    print_to_terminal "  Log File: $LOG_FILE (Max: ${MAX_LOG_SIZE_MB}MB)" "INFO"
+    print_to_terminal "  Auto Log Rotation: $([ "$AUTO_ROTATE_LOG" -eq 1 ] && echo "YES" || echo "NO")" "INFO"
     print_to_terminal "  Lock File: $LOCK_FILE" "INFO"
 }
 
@@ -238,6 +251,116 @@ print_to_terminal() {
             *)         journal_priority="info" ;;
         esac
         logger -t "cdr-cleanup" -p "user.$journal_priority" "$message"
+    fi
+}
+
+# =======================
+# FUNGSI LOG ROTATION
+# =======================
+check_and_rotate_log() {
+    local log_file="$1"
+    local max_size_mb="${MAX_LOG_SIZE_MB:-50}"
+    local max_size_bytes=$((max_size_mb * 1024 * 1024))
+    
+    # Jika auto rotate disabled, skip
+    [[ "${AUTO_ROTATE_LOG:-1}" -eq 0 ]] && return 0
+    
+    # Cek jika log file ada dan ukurannya melebihi batas
+    if [[ -f "$log_file" ]]; then
+        local current_size
+        current_size=$(stat -c%s "$log_file" 2>/dev/null || echo 0)
+        local current_size_mb=$((current_size / 1024 / 1024))
+        
+        if [[ "$current_size" -ge "$max_size_bytes" ]]; then
+            print_to_terminal "Log file size: ${current_size_mb}MB exceeds ${max_size_mb}MB limit" "WARNING"
+            print_to_terminal "Performing automatic log rotation..." "INFO"
+            
+            if rotate_log_now "$log_file"; then
+                print_to_terminal "Log rotation completed successfully" "SUCCESS"
+            else
+                print_to_terminal "Log rotation failed, continuing with existing log" "ERROR"
+            fi
+        elif [[ "$DEBUG_MODE" -eq 1 ]]; then
+            print_to_terminal "Debug: Log file size: ${current_size_mb}MB (Limit: ${max_size_mb}MB)" "DEBUG"
+        fi
+    else
+        print_to_terminal "Debug: Log file not found: $log_file" "DEBUG"
+    fi
+}
+
+rotate_log_now() {
+    local log_file="$1"
+    
+    print_to_terminal "Starting manual log rotation..." "INFO"
+    
+    # Method 1: Gunakan logrotate jika tersedia
+    if command -v logrotate >/dev/null 2>&1 && [[ -f "$LOG_ROTATE_CONFIG" ]]; then
+        print_to_terminal "Using logrotate command..." "DEBUG"
+        
+        # Force logrotate dengan config file
+        if logrotate -f "$LOG_ROTATE_CONFIG" 2>/dev/null; then
+            print_to_terminal "Logrotate command executed successfully" "DEBUG"
+            return 0
+        else
+            print_to_terminal "Logrotate command failed, trying manual method" "WARNING"
+        fi
+    fi
+    
+    # Method 2: Manual rotation (fallback)
+    print_to_terminal "Using manual rotation method..." "DEBUG"
+    
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    local rotated_file="${log_file}.${timestamp}"
+    
+    # Rotate log file
+    if cp "$log_file" "$rotated_file" 2>/dev/null; then
+        # Truncate original log file
+        > "$log_file"
+        print_to_terminal "Rotated log saved to: $rotated_file" "INFO"
+        
+        # Compress rotated file
+        if command -v gzip >/dev/null 2>&1; then
+            if gzip -f "$rotated_file" 2>/dev/null; then
+                print_to_terminal "Rotated log compressed: ${rotated_file}.gz" "DEBUG"
+            else
+                print_to_terminal "Failed to compress rotated log" "WARNING"
+            fi
+        fi
+        
+        # Cleanup old rotated logs (keep last 10)
+        cleanup_old_logs
+        
+        print_to_terminal "Manual log rotation completed" "INFO"
+        return 0
+    else
+        print_to_terminal "Failed to rotate log file" "ERROR"
+        return 1
+    fi
+}
+
+cleanup_old_logs() {
+    local log_dir="/var/log/cdr-cleanup"
+    local keep_days=30
+    
+    if [[ -d "$log_dir" ]]; then
+        print_to_terminal "Cleaning up old log files (older than ${keep_days} days)..." "DEBUG"
+        
+        # Hapus compressed log files yang lebih tua dari keep_days
+        local deleted_count
+        deleted_count=$(find "$log_dir" -name "*.gz" -type f -mtime "+${keep_days}" -delete -print 2>/dev/null | wc -l)
+        
+        if [[ "$deleted_count" -gt 0 ]]; then
+            print_to_terminal "Cleaned up ${deleted_count} old compressed log files" "INFO"
+        fi
+        
+        # Juga cleanup rotated files tanpa extension
+        local rotated_count
+        rotated_count=$(find "$log_dir" -name "$(basename "$LOG_FILE").*" -type f ! -name "*.gz" -mtime "+${keep_days}" -delete -print 2>/dev/null | wc -l)
+        
+        if [[ "$rotated_count" -gt 0 ]]; then
+            print_to_terminal "Cleaned up ${rotated_count} old rotated log files" "INFO"
+        fi
     fi
 }
 
@@ -442,12 +565,18 @@ CONFIGURATION:
     Main config: /etc/cdr-cleanup.conf
     Log file: /var/log/cdr-cleanup/cdr-cleanup.log
     Lock file: /var/lock/cdr-cleanup.lock
+    Log rotation: /etc/logrotate.d/cdr-cleanup
 
 SECURITY FEATURES:
 - Exclude semua hidden files/directories (dimulai dengan .)
 - Exclude default user directories (Desktop, Documents, Downloads, dll)
 - Exclude configuration directories (.config, .ssh, .git, dll)
 - Validasi directory system untuk keamanan
+
+AUTO LOG ROTATION:
+- Log akan di-rotate otomatis jika mencapai ${MAX_LOG_SIZE_MB}MB
+- Menggunakan logrotate atau manual method sebagai fallback
+- Konfigurasi: MAX_LOG_SIZE_MB dan AUTO_ROTATE_LOG di config file
 
 USAGE:
     ./$script_name [OPTIONS]
@@ -480,20 +609,21 @@ OPTIONS:
     --debug               Tampilkan debug messages ke terminal.
     --quiet               Matikan semua output ke terminal (tetap log ke file).
     --config=FILE         Gunakan config file alternatif.
+    --no-log-rotate       Nonaktifkan auto log rotation untuk run ini.
     --help                Tampilkan pesan bantuan ini.
 
 EXAMPLES:
     # 1. Simulasi cleanup dengan threshold dari config
     ./$script_name --dry-run
 
-    # 2. Hapus file tua > 180 hari
+    # 2. Hapus file tua > 180 hari dengan auto log rotation
     ./$script_name --force --age-days=180
 
-    # 3. Cleanup dengan config custom
-    ./$script_name --force --config=/etc/custom-cleanup.conf
+    # 3. Cleanup tanpa auto log rotation
+    ./$script_name --force --threshold=80 --no-log-rotate
 
     # 4. Override directory dari config
-    ./$script_name --force --directory=/data --threshold=75
+    ./$script_name --force --directory=/data --threshold=75 --debug
 
 DEFAULT EXCLUDES:
     • Semua hidden files/directories (.*, */.*)
@@ -505,6 +635,7 @@ DEFAULT EXCLUDES:
 
 LOG ROTATION:
     Logrotate config: /etc/logrotate.d/cdr-cleanup
+    Auto rotation: ${MAX_LOG_SIZE_MB}MB limit atau monthly
 
 EOF
 }
@@ -546,6 +677,9 @@ parse_arguments() {
                 shift ;;
             --config=*)
                 CONFIG_FILE="${1#*=}"
+                shift ;;
+            --no-log-rotate)
+                AUTO_ROTATE_LOG=0
                 shift ;;
             --quiet) 
                 # Redefine print_to_terminal untuk quiet mode
@@ -752,7 +886,7 @@ main() {
     echo "Config: $CONFIG_FILE | Log: $LOG_FILE"
     
     # ============================================
-    # START LOG
+    # START LOG & AUTO ROTATION CHECK
     # ============================================
     print_to_terminal "=========================================" "HEADER"
     print_to_terminal "🚀 CDR CLEANUP STARTED" "HEADER"
@@ -763,6 +897,7 @@ main() {
     print_to_terminal "Hostname: $(hostname)" "INFO"
     print_to_terminal "Script: $(realpath "$0" 2>/dev/null || echo "$0")" "INFO"
     print_to_terminal "Config File: $CONFIG_FILE" "INFO"
+    print_to_terminal "Log File: $LOG_FILE (Max: ${MAX_LOG_SIZE_MB}MB)" "INFO"
     print_to_terminal "=========================================" "HEADER"
     
     # Start time untuk menghitung duration
@@ -786,6 +921,10 @@ main() {
     # Load configuration
     load_config
     
+    # Check and rotate log if needed (sebelum validasi lain)
+    print_to_terminal "Checking log file size..." "INFO"
+    check_and_rotate_log "$LOG_FILE"
+    
     # Validasi input
     if [[ "$THRESHOLD" -lt 1 ]] || [[ "$THRESHOLD" -gt 100 ]]; then
         print_to_terminal "Error: Threshold harus antara 1-100%" "ERROR"
@@ -801,6 +940,9 @@ main() {
         print_to_terminal "Error: MAX_DELETE_PER_RUN minimal 1" "ERROR"
         exit 1
     fi
+    
+    # Cleanup old logs
+    cleanup_old_logs
     
     # Validasi directory
     validate_directory "$DIRECTORY"
@@ -885,6 +1027,26 @@ main() {
     
     print_to_terminal "Cleanup process completed" "SUCCESS"
     
+    # Tambah log size info di summary
+    if [[ -f "$LOG_FILE" ]]; then
+        local log_size_bytes
+        log_size_bytes=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+        local log_size_mb=$((log_size_bytes / 1024 / 1024))
+        local log_size_percent=0
+        
+        if [[ "$MAX_LOG_SIZE_MB" -gt 0 ]]; then
+            log_size_percent=$(( (log_size_bytes * 100) / (MAX_LOG_SIZE_MB * 1024 * 1024) ))
+        fi
+        
+        print_to_terminal "Log file size: ${log_size_mb}MB (${log_size_percent}% of ${MAX_LOG_SIZE_MB}MB limit)" "INFO"
+        
+        if [[ "$log_size_percent" -ge 80 ]] && [[ "$log_size_percent" -lt 100 ]]; then
+            print_to_terminal "Note: Log file approaching size limit" "INFO"
+        elif [[ "$log_size_percent" -ge 100 ]]; then
+            print_to_terminal "Warning: Log file at or over size limit" "WARNING"
+        fi
+    fi
+    
     print_to_terminal "=========================================" "HEADER"
     print_to_terminal "✅ CDR CLEANUP COMPLETED" "HEADER"
     print_to_terminal "Completion Time: $(get_timestamp_ms)" "INFO"
@@ -900,6 +1062,7 @@ main() {
     print_to_terminal "Backup Enabled: $([ "$BACKUP_ENABLED" -eq 1 ] && echo "YES" || echo "NO")" "INFO"
     print_to_terminal "Debug Mode: $([ "$DEBUG_MODE" -eq 1 ] && echo "YES" || echo "NO")" "INFO"
     print_to_terminal "Include Hidden: $([ "$INCLUDE_HIDDEN" -eq 1 ] && echo "YES" || echo "NO")" "INFO"
+    print_to_terminal "Auto Log Rotation: $([ "$AUTO_ROTATE_LOG" -eq 1 ] && echo "YES" || echo "NO")" "INFO"
     
     # Log file info
     if [[ -f "$LOG_FILE" ]]; then
