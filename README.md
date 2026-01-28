@@ -13,10 +13,10 @@
 ├── etc/    
 │   ├── cdr-cleanup.conf              # Main config    
 │   ├── logrotate.d/    
-│   │   └── cdr-cleanup               # Logrotate config    
-│   └── systemd/system/    
-│       ├── cdr-cleanup.service       # Systemd service    
-│       └── cdr-cleanup.timer         # Systemd timer    
+│       │   └── cdr-cleanup               # Logrotate config    
+│       └── systemd/system/    
+│           ├── cdr-cleanup.service       # Systemd service    
+│           └── cdr-cleanup.timer         # Systemd timer    
 ├── usr/    
 │   └── local/    
 │       ├── bin/cdr-cleanup           # Main script    
