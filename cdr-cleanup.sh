@@ -9,15 +9,15 @@ LOG_FILE="/var/log/cdr-cleanup/cdr-cleanup.log"
 LOCK_FILE="/var/lock/cdr-cleanup.lock"
 LOG_ROTATE_CONFIG="/etc/logrotate.d/cdr-cleanup"
 
-# Default values (akan di-override oleh config file)
+# Default values
 DIRECTORY="/home/cdrsbx"
 THRESHOLD=90
-MAX_LOG_SIZE_MB=50           # 50MB (sinkron dengan logrotate config)
-MIN_FILE_COUNT=30            # Minimal file disisakan per directory
-MAX_DELETE_PER_RUN=100       # Max file dihapus per eksekusi
+MAX_LOG_SIZE_MB=50
+MIN_FILE_COUNT=30
+MAX_DELETE_PER_RUN=100
 BACKUP_ENABLED=0
 BACKUP_DIR="/home/backup/deleted_files"
-AUTO_ROTATE_LOG=1            # Enable auto log rotation
+AUTO_ROTATE_LOG=1
 
 DRY_RUN=1
 DEBUG_MODE=0
@@ -30,62 +30,23 @@ DEFAULT_FILE_AGE_DAYS=180
 FILE_AGE_DAYS="$DEFAULT_FILE_AGE_DAYS"
 FILE_AGE_SECONDS=$((FILE_AGE_DAYS * 24 * 60 * 60))
 
+# Mode tracking
+MODE="DISK_THRESHOLD"  # Default mode
+
 # =======================
 # DEFAULT EXCLUDE PATTERNS
 # =======================
-# Hidden files/directories dan system files
 DEFAULT_EXCLUDE_PATTERNS=(
-    # Hidden files and directories
-    '.*'
-    '*/.*'
-    
-    # User home default directories (important)
-    '*/Desktop/*'
-    '*/Documents/*'
-    '*/Downloads/*'
-    '*/Pictures/*'
-    '*/Music/*'
-    '*/Videos/*'
-    '*/Public/*'
-    '*/Templates/*'
-    
-    # Configuration directories
-    '*/\.config/*'
-    '*/\.local/*'
-    '*/\.cache/*'
-    
-    # SSH and security
-    '*/\.ssh/*'
-    '*/\.gnupg/*'
-    '*/\.pki/*'
-    
-    # Version control
-    '*/\.git/*'
-    '*/\.svn/*'
-    '*/\.hg/*'
-    
-    # Application data
-    '*/\.mozilla/*'
-    '*/\.thunderbird/*'
-    '*/\.google-chrome/*'
-    '*/\.vscode/*'
-    
-    # Shell and terminal
-    '*/\.bash*'
-    '*/\.profile'
-    '*/\.zsh*'
-    '*/\.history*'
-    
-    # System files
-    'lost+found'
-    '*/lost+found/*'
-    
-    # Temporary files pattern
-    '*~'
-    '*.swp'
-    '*.swo'
-    '*.tmp'
-    '*.temp'
+    '.*' '*/.*'
+    '*/Desktop/*' '*/Documents/*' '*/Downloads/*' '*/Pictures/*'
+    '*/Music/*' '*/Videos/*' '*/Public/*' '*/Templates/*'
+    '*/\.config/*' '*/\.local/*' '*/\.cache/*'
+    '*/\.ssh/*' '*/\.gnupg/*' '*/\.pki/*'
+    '*/\.git/*' '*/\.svn/*' '*/\.hg/*'
+    '*/\.mozilla/*' '*/\.thunderbird/*' '*/\.google-chrome/*'
+    '*/\.vscode/*' '*/\.bash*' '*/\.profile' '*/\.zsh*'
+    '*/\.history*' 'lost+found' '*/lost+found/*'
+    '*~' '*.swp' '*.swo' '*.tmp' '*.temp'
 )
 
 # =======================
@@ -93,20 +54,22 @@ DEFAULT_EXCLUDE_PATTERNS=(
 # =======================
 TEMP_ALL_FILES=$(mktemp "/tmp/cdr-cleanup.$$.all.XXXXXX")
 TEMP_DELETE_LIST=$(mktemp "/tmp/cdr-cleanup.$$.delete.XXXXXX")
+TEMP_BATCH_LIST=$(mktemp "/tmp/cdr-cleanup.$$.batch.XXXXXX")
 
 # =======================
 # FLAG UNTUK TRACKING ARGUMENTS
 # =======================
-# Global flags untuk tracking argument
 ARG_DIRECTORY_SET=0
 ARG_THRESHOLD_SET=0
 ARG_MAX_DELETE_SET=0
 ARG_MIN_FILES_SET=0
 ARG_BACKUP_SET=0
 ARG_LOG_ROTATE_SET=0
+ARG_AGE_DAYS_SET=0
+ARG_AGE_MONTHS_SET=0
 
 # =======================
-# GLOBAL VARIABLES FOR TIMING & CACHE
+# GLOBAL VARIABLES
 # =======================
 declare -g SCRIPT_START_TIME
 declare -g SCRIPT_END_TIME
@@ -140,47 +103,78 @@ validate_integer() {
     return 0
 }
 
+validate_mutual_exclusive() {
+    local mode_count=0
+    
+    if [[ "$ARG_THRESHOLD_SET" -eq 1 ]]; then
+        mode_count=$((mode_count + 1))
+        MODE="DISK_THRESHOLD"
+    fi
+    
+    if [[ "$ARG_AGE_DAYS_SET" -eq 1 ]]; then
+        mode_count=$((mode_count + 1))
+        MODE="AGE_DAYS"
+    fi
+    
+    if [[ "$ARG_AGE_MONTHS_SET" -eq 1 ]]; then
+        mode_count=$((mode_count + 1))
+        MODE="AGE_MONTHS"
+    fi
+    
+    # Validasi hanya satu mode yang aktif
+    if [[ "$mode_count" -gt 1 ]]; then
+        print_to_terminal "Error: Opsi --threshold, --age-days, dan --age-months tidak bisa digunakan bersamaan" "ERROR"
+        print_to_terminal "Pilih salah satu mode:" "ERROR"
+        print_to_terminal "  --threshold=N    : Hapus file hingga disk usage < N%" "ERROR"
+        print_to_terminal "  --age-days=N     : Hapus file lebih tua dari N hari" "ERROR"
+        print_to_terminal "  --age-months=N   : Hapus file lebih tua dari N bulan" "ERROR"
+        exit 1
+    fi
+    
+    # Jika tidak ada mode yang ditentukan, gunakan default (disk threshold)
+    if [[ "$mode_count" -eq 0 ]]; then
+        MODE="DISK_THRESHOLD"
+        print_to_terminal "No mode specified, using default: Disk Threshold (${THRESHOLD}%)" "INFO"
+    fi
+    
+    return 0
+}
+
 # =======================
 # FUNGSI UTAMA
 # =======================
 cleanup_temp() {
-    rm -f "$TEMP_ALL_FILES" "$TEMP_DELETE_LIST"
+    rm -f "$TEMP_ALL_FILES" "$TEMP_DELETE_LIST" "$TEMP_BATCH_LIST"
     rm -f "$LOCK_FILE" 2>/dev/null
 }
 
-# Trap multiple signals untuk graceful shutdown
 handle_exit() {
     local exit_code=$?
     SCRIPT_END_TIME=$(date +%s)
     
-    # Log termination reason
-    if [[ $exit_code -ne 0 ]] && [[ $exit_code -ne 130 ]]; then  # 130 = SIGINT
+    if [[ $exit_code -ne 0 ]] && [[ $exit_code -ne 130 ]]; then
         print_to_terminal "Script terminated with error/signal (Code: $exit_code)" "ERROR"
     elif [[ $exit_code -eq 130 ]]; then
         print_to_terminal "Script interrupted by user (SIGINT)" "WARNING"
     fi
     
-    # Log duration jika start time tersedia
     if [[ -n "${SCRIPT_START_TIME:-}" ]]; then
         local DURATION=$((SCRIPT_END_TIME - SCRIPT_START_TIME))
         print_to_terminal "Execution duration: ${DURATION} seconds" "INFO"
     fi
     
-    # Cleanup resources
     cleanup_temp
-    
     exit $exit_code
 }
 
-# Register signal handlers
 trap handle_exit EXIT INT TERM HUP
 
 get_timestamp_ms() {
-    date '+%F %T.%3N' # YYYY-MM-DD HH:MM:SS.mmm
+    date '+%F %T.%3N'
 }
 
 get_time_only_ms() {
-    date '+%H:%M:%S.%3N' # HH:MM:SS.mmm (Short version)
+    date '+%H:%M:%S.%3N'
 }
 
 print_to_terminal() {
@@ -189,12 +183,9 @@ print_to_terminal() {
     local timestamp_full=$(get_timestamp_ms)
     local timestamp_short=$(get_time_only_ms)
     
-    # SELALU log ke file
     echo "[$timestamp_full] [$level] $message" >> "$LOG_FILE"
     
-    # Output ke Terminal (jika interaktif)
     if [[ -t 1 ]]; then
-        # Skip terminal output untuk DEBUG mode jika tidak diaktifkan
         if [[ "$level" == "DEBUG" ]] && [[ "$DEBUG_MODE" -eq 0 ]]; then
             return
         fi
@@ -211,7 +202,6 @@ print_to_terminal() {
         esac
     fi
     
-    # Log ke journald jika tersedia
     if command -v logger >/dev/null 2>&1 && [[ -v INVOCATION_ID ]]; then
         local journal_priority
         case "$level" in
@@ -226,6 +216,294 @@ print_to_terminal() {
 }
 
 # =======================
+# PARSING ARGUMEN DENGAN VALIDASI MUTUAL EXCLUSIVE
+# =======================
+parse_arguments() {
+    USER_EXCLUDE_PATTERNS=()
+    INCLUDE_HIDDEN=0
+    
+    # Parse arguments pertama
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run) DRY_RUN=1; shift ;;
+            --force) DRY_RUN=0; shift ;;
+            --backup) BACKUP_ENABLED=1; ARG_BACKUP_SET=1; shift ;;
+            --no-backup) BACKUP_ENABLED=0; ARG_BACKUP_SET=1; shift ;;
+            
+            --threshold=*) 
+                THRESHOLD="${1#*=}"; ARG_THRESHOLD_SET=1
+                validate_integer "$THRESHOLD" "--threshold" 1 100
+                shift ;;
+                
+            --max-delete=*) 
+                MAX_DELETE_PER_RUN="${1#*=}"; ARG_MAX_DELETE_SET=1
+                validate_integer "$MAX_DELETE_PER_RUN" "--max-delete" 1 10000
+                shift ;;
+                
+            --min-files=*) 
+                MIN_FILE_COUNT="${1#*=}"; ARG_MIN_FILES_SET=1
+                validate_integer "$MIN_FILE_COUNT" "--min-files" 0 100000
+                shift ;;
+                
+            --directory=*) 
+                DIRECTORY="${1#*=}"; ARG_DIRECTORY_SET=1
+                shift ;;
+                
+            --age-days=*) 
+                FILE_AGE_DAYS="${1#*=}"; ARG_AGE_DAYS_SET=1
+                validate_integer "$FILE_AGE_DAYS" "--age-days" 1 36500
+                ENABLE_AGE_BASED_CLEANUP=1
+                shift ;;
+                
+            --age-months=*) 
+                local months="${1#*=}"; ARG_AGE_MONTHS_SET=1
+                validate_integer "$months" "--age-months" 1 1200
+                FILE_AGE_DAYS=$(months_to_days "$months")
+                ENABLE_AGE_BASED_CLEANUP=1
+                shift ;;
+                
+            --exclude=*)
+                USER_EXCLUDE_PATTERNS+=("${1#*=}")
+                shift ;;
+                
+            --include-hidden)
+                INCLUDE_HIDDEN=1
+                shift ;;
+                
+            --debug)
+                DEBUG_MODE=1
+                shift ;;
+                
+            --config=*)
+                CONFIG_FILE="${1#*=}"
+                shift ;;
+                
+            --no-log-rotate)
+                AUTO_ROTATE_LOG=0; ARG_LOG_ROTATE_SET=1
+                shift ;;
+                
+            --quiet) 
+                print_to_terminal() {
+                    local message="$1"
+                    local level="${2:-INFO}"
+                    local timestamp_full=$(get_timestamp_ms)
+                    echo "[$timestamp_full] [$level] $message" >> "$LOG_FILE"
+                }
+                shift ;;
+                
+            --help)
+                show_help
+                exit 0 ;;
+                
+            *) 
+                echo "Error: Opsi tidak dikenal '$1'"
+                echo "Gunakan './$(basename "$0") --help' untuk bantuan."
+                exit 1 ;;
+        esac
+    done
+    
+    # Validasi mutual exclusivity setelah semua argument diparsing
+    validate_mutual_exclusive
+    
+    return 0
+}
+
+# =======================
+# LOAD CONFIGURATION FILE - DIPERBAIKI LAGI
+# =======================
+load_config_file() {
+    local config_file="$1"
+    
+    if [[ ! -f "$config_file" ]]; then
+        print_to_terminal "Config file not found: $config_file" "WARNING"
+        return 0
+    fi
+    
+    print_to_terminal "Loading configuration from $config_file" "INFO"
+    
+    # Gunakan approach yang lebih aman untuk membaca config
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
+        # Skip comments and empty lines
+        [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+        
+        # Trim whitespace dan quotes dari key
+        key=$(echo "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+        
+        # Trim whitespace dan quotes dari value
+        value=$(echo "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+        
+        # Skip jika key kosong
+        [[ -z "$key" ]] && continue
+        
+        # Debug logging jika perlu
+        if [[ "$DEBUG_MODE" -eq 1 ]]; then
+            print_to_terminal "Config: $key='$value'" "DEBUG"
+        fi
+        
+        # Hanya load nilai jika belum di-set via command line
+        case "$key" in
+            DIRECTORY)
+                if [[ "$ARG_DIRECTORY_SET" -eq 0 ]] && [[ -n "$value" ]]; then
+                    DIRECTORY="$value"
+                fi
+                ;;
+            THRESHOLD)
+                if [[ "$ARG_THRESHOLD_SET" -eq 0 ]] && [[ -n "$value" ]]; then
+                    THRESHOLD="$value"
+                fi
+                ;;
+            MAX_DELETE_PER_RUN)
+                if [[ "$ARG_MAX_DELETE_SET" -eq 0 ]] && [[ -n "$value" ]]; then
+                    MAX_DELETE_PER_RUN="$value"
+                fi
+                ;;
+            MIN_FILE_COUNT)
+                if [[ "$ARG_MIN_FILES_SET" -eq 0 ]] && [[ -n "$value" ]]; then
+                    MIN_FILE_COUNT="$value"
+                fi
+                ;;
+            BACKUP_ENABLED)
+                if [[ "$ARG_BACKUP_SET" -eq 0 ]] && [[ -n "$value" ]]; then
+                    BACKUP_ENABLED="$value"
+                fi
+                ;;
+            AUTO_ROTATE_LOG)
+                if [[ "$ARG_LOG_ROTATE_SET" -eq 0 ]] && [[ -n "$value" ]]; then
+                    AUTO_ROTATE_LOG="$value"
+                fi
+                ;;
+            FILE_AGE_DAYS)
+                if [[ "$ARG_AGE_DAYS_SET" -eq 0 ]] && [[ "$ARG_AGE_MONTHS_SET" -eq 0 ]] && [[ -n "$value" ]]; then
+                    FILE_AGE_DAYS="$value"
+                fi
+                ;;
+            LOG_FILE)
+                if [[ -n "$value" ]]; then
+                    LOG_FILE="$value"
+                fi
+                ;;
+            BACKUP_DIR)
+                if [[ -n "$value" ]]; then
+                    BACKUP_DIR="$value"
+                fi
+                ;;
+            MAX_LOG_SIZE_MB)
+                if [[ -n "$value" ]]; then
+                    MAX_LOG_SIZE_MB="$value"
+                fi
+                ;;
+            DEBUG_MODE)
+                if [[ -n "$value" ]]; then
+                    DEBUG_MODE="$value"
+                fi
+                ;;
+            # Handle other variables safely
+            *)
+                # Only set if it's a valid variable name
+                if [[ "$key" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] && [[ -n "$value" ]]; then
+                    # Use printf untuk menghindari interpretasi khusus
+                    printf -v "$key" '%s' "$value"
+                fi
+                ;;
+        esac
+    done < "$config_file"
+    
+    # Update calculated values setelah semua config di-load
+    FILE_AGE_SECONDS=$((FILE_AGE_DAYS * 24 * 60 * 60))
+    
+    # Debug output untuk memverifikasi
+    if [[ "$DEBUG_MODE" -eq 1 ]]; then
+        print_to_terminal "After config load:" "DEBUG"
+        print_to_terminal "  DIRECTORY='$DIRECTORY'" "DEBUG"
+        print_to_terminal "  THRESHOLD='$THRESHOLD'" "DEBUG"
+        print_to_terminal "  MAX_DELETE_PER_RUN='$MAX_DELETE_PER_RUN'" "DEBUG"
+        print_to_terminal "  MIN_FILE_COUNT='$MIN_FILE_COUNT'" "DEBUG"
+    fi
+    
+    return 0
+}
+
+# =======================
+# HELP & USAGE
+# =======================
+show_help() {
+    local script_name
+    script_name=$(basename "${0}")
+    
+    cat << EOF
+CDR CLEANUP UTILITY FOR RHEL 9
+--------------------------------
+Script ini menghapus file lama dengan dua mode yang saling eksklusif:
+
+MODE 1: DISK THRESHOLD (Default)
+    Hapus file terlama hingga disk usage di bawah threshold.
+    Opsi: --threshold=N (1-100)
+
+MODE 2: AGE BASED
+    Hapus semua file yang lebih tua dari N hari/bulan.
+    Opsi: --age-days=N ATAU --age-months=N
+
+❗ PERHATIAN: Mode-mode di atas TIDAK BISA digunakan bersamaan.
+    Pilih salah satu: --threshold ATAU --age-days ATAU --age-months
+
+CONFIGURATION:
+    Main config: /etc/cdr-cleanup.conf
+    Log file: /var/log/cdr-cleanup/cdr-cleanup.log
+    Lock file: /var/lock/cdr-cleanup.lock
+
+USAGE:
+    ./$script_name [OPTIONS]
+
+OPTIONS UTAMA (PILIH SALAH SATU):
+    --threshold=N         Batas disk usage (1-100%). Mode: Disk Threshold.
+    --age-days=N          Hapus file > N hari. Mode: Age Based.
+    --age-months=N        Hapus file > N bulan. Mode: Age Based.
+
+OPTIONS TAMBAHAN:
+    --dry-run             Simulasi saja (Default).
+    --force               Jalankan penghapusan secara nyata.
+    --directory=PATH      Target direktori.
+    --min-files=N         Minimum file per folder (0-100000).
+    --max-delete=N        Maksimum file dihapus per run (1-10000).
+    --exclude=PATTERN     Tambah pattern exclude.
+    --include-hidden      Include hidden files.
+    --backup              Backup sebelum hapus.
+    --no-backup           Nonaktifkan backup.
+    --debug               Tampilkan debug messages.
+    --quiet               Matikan output terminal.
+    --config=FILE         Config file alternatif.
+    --no-log-rotate       Nonaktifkan auto log rotation.
+    --help                Tampilkan bantuan.
+
+CONTOH MODE DISK THRESHOLD:
+    # Cleanup hingga disk usage < 85%
+    ./$script_name --force --threshold=85
+    
+    # Dengan parameter tambahan
+    ./$script_name --force --threshold=80 --max-delete=500 --min-files=10
+
+CONTOH MODE AGE BASED:
+    # Hapus file > 180 hari
+    ./$script_name --force --age-days=180
+    
+    # Hapus file > 6 bulan
+    ./$script_name --force --age-months=6
+
+CONTOH TIDAK VALID (ERROR):
+    ./$script_name --threshold=85 --age-days=180  # ❌ TIDAK BISA BERSAMAAN
+    ./$script_name --age-days=90 --age-months=3   # ❌ TIDAK BISA BERSAMAAN
+
+FEATURES:
+- Iterative disk checking untuk mode threshold
+- File age cache untuk performance
+- Safety limits: max delete per run, min files per dir
+- Auto log rotation
+- Lock file untuk prevent multiple execution
+
+EOF
+}
+
+# =======================
 # FUNGSI LOG ROTATION
 # =======================
 check_and_rotate_log() {
@@ -233,7 +511,6 @@ check_and_rotate_log() {
     local max_size_mb="${MAX_LOG_SIZE_MB:-50}"
     local max_size_bytes=$((max_size_mb * 1024 * 1024))
     
-    # Skip jika auto rotate disabled
     [[ "${AUTO_ROTATE_LOG:-1}" -eq 0 ]] && return 0
     
     if [[ -f "$log_file" ]]; then
@@ -250,8 +527,6 @@ check_and_rotate_log() {
             else
                 print_to_terminal "Log rotation failed, continuing with existing log" "ERROR"
             fi
-        elif [[ "$DEBUG_MODE" -eq 1 ]]; then
-            print_to_terminal "Debug: Log file size: ${current_size_mb}MB (Limit: ${max_size_mb}MB)" "DEBUG"
         fi
     fi
 }
@@ -261,65 +536,28 @@ rotate_log_now() {
     
     print_to_terminal "Starting manual log rotation..." "INFO"
     
-    # Coba gunakan logrotate jika tersedia
     if command -v logrotate >/dev/null 2>&1 && [[ -f "$LOG_ROTATE_CONFIG" ]]; then
         if logrotate -f "$LOG_ROTATE_CONFIG" 2>/dev/null; then
-            print_to_terminal "Logrotate command executed successfully" "DEBUG"
             return 0
-        else
-            print_to_terminal "Logrotate command failed, trying manual method" "WARNING"
         fi
     fi
     
-    # Manual rotation (fallback)
     local timestamp
     timestamp=$(date +%Y%m%d_%H%M%S)
     local rotated_file="${log_file}.${timestamp}"
     
     if cp "$log_file" "$rotated_file" 2>/dev/null; then
-        # Truncate original log file
         > "$log_file"
         print_to_terminal "Rotated log saved to: $rotated_file" "INFO"
         
-        # Compress rotated file
         if command -v gzip >/dev/null 2>&1; then
-            if gzip -f "$rotated_file" 2>/dev/null; then
-                print_to_terminal "Rotated log compressed: ${rotated_file}.gz" "DEBUG"
-            fi
+            gzip -f "$rotated_file" 2>/dev/null || true
         fi
-        
-        # Cleanup old rotated logs
-        cleanup_old_logs
         
         return 0
     else
         print_to_terminal "Failed to rotate log file" "ERROR"
         return 1
-    fi
-}
-
-cleanup_old_logs() {
-    local log_dir="/var/log/cdr-cleanup"
-    local keep_days=30
-    
-    if [[ -d "$log_dir" ]]; then
-        print_to_terminal "Cleaning up old log files (older than ${keep_days} days)..." "DEBUG"
-        
-        # Hapus compressed log files
-        local deleted_count
-        deleted_count=$(find "$log_dir" -name "*.gz" -type f -mtime "+${keep_days}" -delete -print 2>/dev/null | wc -l)
-        
-        if [[ "$deleted_count" -gt 0 ]]; then
-            print_to_terminal "Cleaned up ${deleted_count} old compressed log files" "INFO"
-        fi
-        
-        # Juga cleanup rotated files tanpa extension
-        local rotated_count
-        rotated_count=$(find "$log_dir" -name "$(basename "$LOG_FILE").*" -type f ! -name "*.gz" -mtime "+${keep_days}" -delete -print 2>/dev/null | wc -l)
-        
-        if [[ "$rotated_count" -gt 0 ]]; then
-            print_to_terminal "Cleaned up ${rotated_count} old rotated log files" "INFO"
-        fi
     fi
 }
 
@@ -332,7 +570,7 @@ get_disk_usage() {
     local dir="$1"
     
     if [[ -z "$dir" ]] || [[ ! -d "$dir" ]]; then
-        print_to_terminal "Error: Directory '$dir' tidak valid untuk get_disk_usage" "ERROR"
+        print_to_terminal "Error: Directory '$dir' tidak valid" "ERROR"
         echo "0"
         return 1
     fi
@@ -349,12 +587,7 @@ get_disk_usage() {
     local usage
     usage=$(echo "$df_output" | awk 'NR==2 {gsub(/%/, "", $5); print $5}')
     
-    if [[ "$DEBUG_MODE" -eq 1 ]]; then
-        print_to_terminal "Debug: Disk usage untuk $dir: ${usage}%" "DEBUG"
-    fi
-    
     if [[ -z "$usage" ]] || ! [[ "$usage" =~ ^[0-9]+$ ]]; then
-        print_to_terminal "Warning: Nilai disk usage tidak valid: '$usage'" "WARNING"
         echo "0"
         return 1
     fi
@@ -365,7 +598,6 @@ get_disk_usage() {
 get_file_age_days() {
     local filepath="$1"
     
-    # Gunakan cache untuk performance
     if [[ -n "${FILE_AGE_CACHE[$filepath]:-}" ]]; then
         echo "${FILE_AGE_CACHE[$filepath]}"
         return
@@ -382,429 +614,233 @@ get_file_age_days() {
     fi
 }
 
-validate_directory() {
-    local dir="$1"
+# =======================
+# ITERATIVE DISK THRESHOLD CLEANUP
+# =======================
+perform_disk_threshold_cleanup() {
+    print_to_terminal "Starting DISK THRESHOLD cleanup..." "INFO"
+    print_to_terminal "Target: Disk usage < ${THRESHOLD}%" "INFO"
+    print_to_terminal "Max files to delete: $MAX_DELETE_PER_RUN" "INFO"
+    print_to_terminal "Min files per directory: $MIN_FILE_COUNT" "INFO"
     
-    if [[ ! -d "$dir" ]]; then
-        print_to_terminal "Error: Directory '$dir' tidak ditemukan" "ERROR"
-        exit 1
-    fi
+    local current_usage
+    current_usage=$(get_disk_usage "$DIRECTORY")
+    local initial_usage="$current_usage"
     
-    if [[ ! -r "$dir" ]] || [[ ! -x "$dir" ]]; then
-        print_to_terminal "Error: Tidak ada permission read/execute untuk '$dir'" "ERROR"
-        exit 1
-    fi
-    
-    # Prevent cleanup of protected system directories
-    local protected_dirs=("/" "/bin" "/sbin" "/usr" "/etc" "/boot" "/lib" "/lib64" "/var" "/sys" "/proc" "/dev")
-    for protected in "${protected_dirs[@]}"; do
-        if [[ "$dir" == "$protected" ]] || [[ "$dir" == "$protected/"* ]]; then
-            print_to_terminal "Error: Directory '$dir' adalah system protected directory" "ERROR"
-            exit 1
-        fi
-    done
-    
-    if ! df -P "$dir" >/dev/null 2>&1; then
-        print_to_terminal "Warning: Directory '$dir' mungkin bukan mount point yang valid" "WARNING"
-    fi
-}
-
-check_security_files() {
-    local dir="$1"
-    
-    local security_patterns=(
-        "authorized_keys"
-        "known_hosts"
-        "id_rsa"
-        "id_dsa"
-        "*.pem"
-        "*.key"
-        "*.crt"
-        "shadow"
-        "passwd"
-        "*.db"
-        "selinux/*"
-    )
-    
-    for pattern in "${security_patterns[@]}"; do
-        # Hindari SIGPIPE dengan membaca semua output dulu
-        local found_files
-        found_files=$(find "$dir" -name "$pattern" -type f 2>/dev/null)
-        
-        if [[ -n "$found_files" ]]; then
-            print_to_terminal "WARNING: Directory mengandung file security-sensitive: $pattern" "WARNING"
-            
-            if [[ "$DEBUG_MODE" -eq 1 ]]; then
-                print_to_terminal "Debug: Found security files: $(echo "$found_files" | head -3 | tr '\n' ',')" "DEBUG"
-            fi
-            
-            if [[ "$DRY_RUN" -eq 0 ]] && [[ -t 0 ]]; then
-                read -p "Lanjutkan? (y/N): " -n 1 -r
-                echo
-                [[ ! $REPLY =~ ^[Yy]$ ]] && exit 0
-            fi
-            break
-        fi
-    done
-}
-
-backup_file() {
-    local filepath="$1"
-    [[ "$BACKUP_ENABLED" -eq 0 ]] && return 0
-    
-    local filename=$(basename "$filepath")
-    local safe_dirname=$(dirname "$filepath" | sed 's/[^a-zA-Z0-9.-]/_/g')
-    local backup_path="$BACKUP_DIR/$(date +%Y%m%d)/$safe_dirname"
-    
-    mkdir -p "$backup_path" 2>/dev/null
-    
-    # Preserve SELinux context jika SELinux enabled
-    local selinux_enabled=0
-    if command -v getenforce >/dev/null 2>&1; then
-        if [[ "$(getenforce)" != "Disabled" ]]; then
-            selinux_enabled=1
-        fi
-    fi
-    
-    if [[ "$selinux_enabled" -eq 1 ]]; then
-        if cp --preserve=context -- "$filepath" "$backup_path/$filename" 2>/dev/null; then
-            print_to_terminal "Backup dengan SELinux context: $filepath" "INFO"
-        elif cp --preserve=all -- "$filepath" "$backup_path/$filename" 2>/dev/null; then
-            print_to_terminal "Backup: $filepath" "INFO"
-        else
-            cp -- "$filepath" "$backup_path/$filename" 2>/dev/null
-            print_to_terminal "Backup (tanpa preserve): $filepath" "WARNING"
-        fi
-    else
-        if cp --preserve=all -- "$filepath" "$backup_path/$filename" 2>/dev/null; then
-            print_to_terminal "Backup: $filepath" "INFO"
-        else
-            cp -- "$filepath" "$backup_path/$filename" 2>/dev/null
-            print_to_terminal "Backup (basic): $filepath" "INFO"
-        fi
-    fi
-}
-
-safe_delete() {
-    local filepath="$1"
-    
-    if [[ "$BACKUP_ENABLED" -eq 1 ]]; then
-        backup_file "$filepath"
-    fi
-    
-    if [[ "$DRY_RUN" -eq 1 ]]; then
-        local age_days=$(get_file_age_days "$filepath")
-        print_to_terminal "Would delete: $filepath (Age: $age_days days)" "DRY_RUN"
-        return 0
-    fi
-    
-    if rm -f -- "$filepath"; then
-        print_to_terminal "Deleted: $filepath" "SUCCESS"
-        return 0
-    else
-        print_to_terminal "Failed to delete: $filepath" "ERROR"
+    if [[ "$current_usage" -eq 0 ]]; then
+        print_to_terminal "Error: Cannot get disk usage for $DIRECTORY" "ERROR"
         return 1
     fi
-}
-
-# =======================
-# HELP & USAGE
-# =======================
-show_help() {
-    local script_name
-    script_name=$(basename "${0}")
     
-    cat << EOF
-CDR Cleanup Utility for RHEL 9
---------------------------------
-Script ini menghapus file lama berdasarkan penggunaan disk (threshold) atau umur file,
-dengan mekanisme proteksi jumlah file minimum per folder.
-
-CONFIGURATION:
-    Main config: /etc/cdr-cleanup.conf
-    Log file: /var/log/cdr-cleanup/cdr-cleanup.log
-    Lock file: /var/lock/cdr-cleanup.lock
-    Log rotation: /etc/logrotate.d/cdr-cleanup
-
-SECURITY FEATURES:
-- Exclude semua hidden files/directories (dimulai dengan .)
-- Exclude default user directories (Desktop, Documents, Downloads, dll)
-- Exclude configuration directories (.config, .ssh, .git, dll)
-- Validasi directory system untuk keamanan
-
-AUTO LOG ROTATION:
-- Log akan di-rotate otomatis jika mencapai ${MAX_LOG_SIZE_MB}MB
-- Menggunakan logrotate atau manual method sebagai fallback
-- Konfigurasi: MAX_LOG_SIZE_MB dan AUTO_ROTATE_LOG di config file
-
-USAGE:
-    ./$script_name [OPTIONS]
-
-MODES:
-    1. Disk Threshold (Default):
-       Hapus file terlama hanya jika penggunaan disk >= threshold.
-    2. Age Based (--age-days / --age-months):
-       Hapus file yang umurnya > N hari/bulan tanpa melihat disk usage.
-
-OPTIONS:
-    --dry-run             Simulasi saja, tidak menghapus file (Default).
-    --force               Jalankan penghapusan file secara nyata.
+    print_to_terminal "Current disk usage: ${current_usage}%" "INFO"
     
-    --threshold=N         Batas persen disk usage (Default: dari config).
-                          
-    --age-days=N          Hapus file > N hari. Mengaktifkan mode Age Based.
-    --age-months=N        Hapus file > N bulan. Mengaktifkan mode Age Based.
+    if [[ "$current_usage" -lt "$THRESHOLD" ]]; then
+        print_to_terminal "Disk usage already below threshold ($current_usage% < $THRESHOLD%). No action needed." "SUCCESS"
+        return 0
+    fi
     
-    --directory=PATH      Target direktori (Override config).
-    --min-files=N         Minimum file yang WAJIB disisakan per folder (Override config).
-    --max-delete=N        Batas maksimum file yang dihapus per eksekusi (Override config).
+    # Generate initial file list (oldest first)
+    if ! generate_all_files_list; then
+        print_to_terminal "Failed to generate file list" "ERROR"
+        return 1
+    fi
     
-    --exclude=PATTERN     Tambah pattern untuk exclude (bisa digunakan berkali-kali).
-    --include-hidden      INCLUDE hidden files/directories (TIDAK DISARANKAN!).
+    local iteration=1
+    local total_deleted=0
     
-    --backup              Backup file sebelum dihapus (Override config).
-    --no-backup           Nonaktifkan backup (Override config).
-    --debug               Tampilkan debug messages ke terminal.
-    --quiet               Matikan semua output ke terminal (tetap log ke file).
-    --config=FILE         Gunakan config file alternatif.
-    --no-log-rotate       Nonaktifkan auto log rotation untuk run ini.
-    --help                Tampilkan pesan bantuan ini.
-
-EXAMPLES:
-    # Simulasi cleanup dengan threshold dari config
-    ./$script_name --dry-run
-
-    # Hapus file tua > 180 hari
-    ./$script_name --force --age-days=180
-
-    # Cleanup tanpa auto log rotation
-    ./$script_name --force --threshold=80 --no-log-rotate
-
-    # Override directory dari config
-    ./$script_name --force --directory=/data --threshold=75 --debug
-
-DEFAULT EXCLUDES:
-    • Semua hidden files/directories (.*, */.*)
-    • User home directories: Desktop, Documents, Downloads, Pictures, Music, Videos
-    • Configuration: .config, .local, .cache, .ssh, .gnupg
-    • Version control: .git, .svn, .hg
-    • Application data: .mozilla, .thunderbird, .vscode
-    • Shell files: .bash*, .profile, .zsh*
-
-EOF
-}
-
-# =======================
-# PARSING ARGUMEN
-# =======================
-parse_arguments() {
-    USER_EXCLUDE_PATTERNS=()
-    INCLUDE_HIDDEN=0
-    
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --dry-run) DRY_RUN=1; shift ;;
-            --force) DRY_RUN=0; shift ;;
-            --backup) BACKUP_ENABLED=1; ARG_BACKUP_SET=1; shift ;;
-            --no-backup) BACKUP_ENABLED=0; ARG_BACKUP_SET=1; shift ;;
-            --threshold=*) 
-                THRESHOLD="${1#*=}"; ARG_THRESHOLD_SET=1
-                validate_integer "$THRESHOLD" "--threshold" 1 100
-                shift ;;
-            --max-delete=*) 
-                MAX_DELETE_PER_RUN="${1#*=}"; ARG_MAX_DELETE_SET=1
-                validate_integer "$MAX_DELETE_PER_RUN" "--max-delete" 1 10000
-                shift ;;
-            --min-files=*) 
-                MIN_FILE_COUNT="${1#*=}"; ARG_MIN_FILES_SET=1
-                validate_integer "$MIN_FILE_COUNT" "--min-files" 0 100000
-                shift ;;
-            --directory=*) 
-                DIRECTORY="${1#*=}"; ARG_DIRECTORY_SET=1
-                shift ;;
-            --age-days=*) 
-                ENABLE_AGE_BASED_CLEANUP=1
-                FILE_AGE_DAYS="${1#*=}"
-                validate_integer "$FILE_AGE_DAYS" "--age-days" 1 36500  # 1-100 tahun
-                shift ;;
-            --age-months=*) 
-                ENABLE_AGE_BASED_CLEANUP=1
-                local months="${1#*=}"
-                validate_integer "$months" "--age-months" 1 1200  # 1-100 tahun
-                FILE_AGE_DAYS=$(months_to_days "$months")
-                shift ;;
-            --exclude=*)
-                USER_EXCLUDE_PATTERNS+=("${1#*=}")
-                shift ;;
-            --include-hidden)
-                INCLUDE_HIDDEN=1
-                shift ;;
-            --debug)
-                DEBUG_MODE=1
-                shift ;;
-            --config=*)
-                CONFIG_FILE="${1#*=}"
-                shift ;;
-            --no-log-rotate)
-                AUTO_ROTATE_LOG=0; ARG_LOG_ROTATE_SET=1
-                shift ;;
-            --quiet) 
-                print_to_terminal() {
-                    local message="$1"
-                    local level="${2:-INFO}"
-                    local timestamp_full=$(get_timestamp_ms)
-                    echo "[$timestamp_full] [$level] $message" >> "$LOG_FILE"
-                }
-                shift ;;
-            --help)
-                show_help
-                exit 0 ;;
-            *) 
-                echo "Error: Opsi tidak dikenal '$1'"
-                echo "Gunakan './$(basename "$0") --help' untuk bantuan."
-                exit 1 ;;
-        esac
+    # ITERATIVE LOOP: Hentikan saat threshold tercapai atau max delete tercapai
+    while [[ "$current_usage" -ge "$THRESHOLD" ]] && [[ "$total_deleted" -lt "$MAX_DELETE_PER_RUN" ]]; do
+        print_to_terminal "--- Iteration $iteration ---" "INFO"
+        print_to_terminal "Current: ${current_usage}%, Target: <${THRESHOLD}%" "INFO"
+        print_to_terminal "Remaining delete quota: $((MAX_DELETE_PER_RUN - total_deleted)) files" "INFO"
+        
+        # Calculate adaptive batch size
+        local batch_size=50
+        local remaining_to_target=$((current_usage - THRESHOLD))
+        
+        if [[ "$remaining_to_target" -lt 3 ]]; then
+            batch_size=10
+        elif [[ "$remaining_to_target" -lt 10 ]]; then
+            batch_size=25
+        fi
+        
+        # Adjust based on remaining quota
+        if [[ $batch_size -gt $((MAX_DELETE_PER_RUN - total_deleted)) ]]; then
+            batch_size=$((MAX_DELETE_PER_RUN - total_deleted))
+        fi
+        
+        if [[ $batch_size -eq 0 ]]; then
+            print_to_terminal "Reached maximum delete limit" "WARNING"
+            break
+        fi
+        
+        print_to_terminal "Processing batch of $batch_size files..." "INFO"
+        
+        # Get next batch of files to delete
+        local batch_deleted
+        batch_deleted=$(get_next_batch "$batch_size")
+        
+        if [[ "$batch_deleted" -eq 0 ]]; then
+            print_to_terminal "No more files eligible for deletion (min files per dir constraint)" "INFO"
+            break
+        fi
+        
+        # Delete the batch
+        local actual_deleted
+        actual_deleted=$(delete_batch)
+        total_deleted=$((total_deleted + actual_deleted))
+        
+        # Get updated disk usage SETELAH menghapus batch
+        local previous_usage="$current_usage"
+        current_usage=$(get_disk_usage "$DIRECTORY")
+        
+        print_to_terminal "Batch result: Deleted $actual_deleted files" "INFO"
+        print_to_terminal "Disk usage: ${previous_usage}% → ${current_usage}%" "INFO"
+        
+        # Check if we've reached threshold
+        if [[ "$current_usage" -lt "$THRESHOLD" ]]; then
+            print_to_terminal "✓ Threshold reached! ($current_usage% < $THRESHOLD%)" "SUCCESS"
+            break
+        fi
+        
+        iteration=$((iteration + 1))
+        
+        # Small delay to allow filesystem updates
+        sleep 1
     done
+    
+    # Final report
+    local final_reduction=$((initial_usage - current_usage))
+    print_to_terminal "=== DISK THRESHOLD CLEANUP COMPLETE ===" "SUCCESS"
+    print_to_terminal "Initial disk usage: ${initial_usage}%" "INFO"
+    print_to_terminal "Final disk usage: ${current_usage}%" "INFO"
+    print_to_terminal "Reduction: ${final_reduction}%" "INFO"
+    print_to_terminal "Total files deleted: ${total_deleted}" "INFO"
+    print_to_terminal "Iterations: $((iteration - 1))" "INFO"
+    
+    if [[ "$current_usage" -ge "$THRESHOLD" ]]; then
+        print_to_terminal "Note: Still above threshold after deleting ${total_deleted} files" "WARNING"
+        if [[ "$total_deleted" -eq "$MAX_DELETE_PER_RUN" ]]; then
+            print_to_terminal "Maximum delete limit ($MAX_DELETE_PER_RUN) reached" "INFO"
+        fi
+    fi
+    
+    return 0
 }
 
 # =======================
-# FUNGSI LOAD CONFIG
+# AGE BASED CLEANUP
 # =======================
-load_config() {
-    if [[ -f "$CONFIG_FILE" ]]; then
-        print_to_terminal "Loading configuration from $CONFIG_FILE" "INFO"
+perform_age_based_cleanup() {
+    print_to_terminal "Starting AGE BASED cleanup..." "INFO"
+    print_to_terminal "Target: Files older than ${FILE_AGE_DAYS} days" "INFO"
+    print_to_terminal "Max files to delete: $MAX_DELETE_PER_RUN" "INFO"
+    print_to_terminal "Min files per directory: $MIN_FILE_COUNT" "INFO"
+    
+    # Generate file list
+    if ! generate_all_files_list; then
+        print_to_terminal "Failed to generate file list" "ERROR"
+        return 1
+    fi
+    
+    local current_time=$(date +%s)
+    local cutoff_time=$((current_time - (FILE_AGE_DAYS * 86400)))
+    local total_eligible=0
+    local total_deleted=0
+    
+    # Count eligible files
+    while IFS='|' read -r timestamp_str filepath; do
+        local dirname=$(dirname "$filepath")
+        local current_count=${DIR_COUNTS_CACHE["$dirname"]:-0}
         
-        # Simpan nilai dari arguments sebelum di-override
-        local ARG_DIRECTORY="$DIRECTORY"
-        local ARG_THRESHOLD="$THRESHOLD"
-        local ARG_MAX_DELETE="$MAX_DELETE_PER_RUN"
-        local ARG_MIN_FILES="$MIN_FILE_COUNT"
-        local ARG_BACKUP_ENABLED="$BACKUP_ENABLED"
-        local ARG_BACKUP_DIR="$BACKUP_DIR"
-        local ARG_AUTO_ROTATE_LOG="$AUTO_ROTATE_LOG"
-        
-        if ! source "$CONFIG_FILE" 2>/dev/null; then
-            print_to_terminal "Error: Failed to load config file $CONFIG_FILE" "ERROR"
-            exit 1
+        if [[ "$current_count" -le "$MIN_FILE_COUNT" ]]; then
+            continue
         fi
         
-        print_to_terminal "Merging command line arguments with config..." "DEBUG"
-        
-        # Command line arguments > Config file > Default values
-        if [[ "$ARG_DIRECTORY_SET" -eq 1 ]]; then
-            DIRECTORY="$ARG_DIRECTORY"
-            print_to_terminal "Using directory from arguments: $DIRECTORY" "DEBUG"
-        elif [[ -z "${DIRECTORY:-}" ]]; then
-            DIRECTORY="/home/cdrsbx"
-            print_to_terminal "Using default directory: $DIRECTORY" "DEBUG"
+        local file_ts
+        if [[ "$timestamp_str" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+            file_ts=$(printf "%.0f" "$timestamp_str")
+        else
+            file_ts=${timestamp_str%%.*}
         fi
         
-        if [[ "$ARG_THRESHOLD_SET" -eq 1 ]]; then
-            THRESHOLD="$ARG_THRESHOLD"
-            print_to_terminal "Using threshold from arguments: $THRESHOLD" "DEBUG"
-        elif [[ -z "${THRESHOLD:-}" ]] || ! [[ "$THRESHOLD" =~ ^[0-9]+$ ]]; then
-            THRESHOLD=90
-            print_to_terminal "Using default threshold: $THRESHOLD" "DEBUG"
+        if [[ "$file_ts" -lt "$cutoff_time" ]]; then
+            total_eligible=$((total_eligible + 1))
+        fi
+    done < "$TEMP_ALL_FILES"
+    
+    print_to_terminal "Found $total_eligible files older than $FILE_AGE_DAYS days" "INFO"
+    
+    if [[ "$total_eligible" -eq 0 ]]; then
+        print_to_terminal "No files meet the age criteria" "INFO"
+        return 0
+    fi
+    
+    # Select files for deletion
+    > "$TEMP_DELETE_LIST"
+    
+    while IFS='|' read -r timestamp_str filepath && [[ $total_deleted -lt $MAX_DELETE_PER_RUN ]]; do
+        local dirname=$(dirname "$filepath")
+        local current_count=${DIR_COUNTS_CACHE["$dirname"]:-0}
+        
+        if [[ "$current_count" -le "$MIN_FILE_COUNT" ]]; then
+            continue
         fi
         
-        if [[ "$ARG_MIN_FILES_SET" -eq 1 ]]; then
-            MIN_FILE_COUNT="$ARG_MIN_FILES"
-            print_to_terminal "Using min-files from arguments: $MIN_FILE_COUNT" "DEBUG"
-        elif [[ -z "${MIN_FILE_COUNT:-}" ]] || ! [[ "$MIN_FILE_COUNT" =~ ^[0-9]+$ ]]; then
-            MIN_FILE_COUNT=30
-            print_to_terminal "Using default min-files: $MIN_FILE_COUNT" "DEBUG"
+        local file_ts
+        if [[ "$timestamp_str" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+            file_ts=$(printf "%.0f" "$timestamp_str")
+        else
+            file_ts=${timestamp_str%%.*}
         fi
         
-        if [[ "$ARG_MAX_DELETE_SET" -eq 1 ]]; then
-            MAX_DELETE_PER_RUN="$ARG_MAX_DELETE"
-            print_to_terminal "Using max-delete from arguments: $MAX_DELETE_PER_RUN" "DEBUG"
-        elif [[ -z "${MAX_DELETE_PER_RUN:-}" ]] || ! [[ "$MAX_DELETE_PER_RUN" =~ ^[0-9]+$ ]]; then
-            MAX_DELETE_PER_RUN=100
-            print_to_terminal "Using default max-delete: $MAX_DELETE_PER_RUN" "DEBUG"
+        if [[ "$file_ts" -lt "$cutoff_time" ]]; then
+            echo "$filepath" >> "$TEMP_DELETE_LIST"
+            DIR_COUNTS_CACHE["$dirname"]=$((current_count - 1))
+            total_deleted=$((total_deleted + 1))
         fi
+    done < "$TEMP_ALL_FILES"
+    
+    # Process deletions
+    if [[ -s "$TEMP_DELETE_LIST" ]]; then
+        local count=0
+        local errors=0
         
-        if [[ "$ARG_BACKUP_SET" -eq 1 ]]; then
-            BACKUP_ENABLED="$ARG_BACKUP_ENABLED"
-            print_to_terminal "Using backup from arguments: $BACKUP_ENABLED" "DEBUG"
-        elif [[ -z "${BACKUP_ENABLED:-}" ]] || ! [[ "$BACKUP_ENABLED" =~ ^[0-1]$ ]]; then
-            BACKUP_ENABLED=0
-            print_to_terminal "Using default backup: $BACKUP_ENABLED" "DEBUG"
-        fi
+        while read -r filepath; do
+            if [[ "$DRY_RUN" -eq 1 ]]; then
+                local age_days=$(get_file_age_days "$filepath")
+                print_to_terminal "Would delete: $filepath (Age: $age_days days)" "DRY_RUN"
+                count=$((count + 1))
+            else
+                if rm -f -- "$filepath"; then
+                    print_to_terminal "Deleted: $filepath" "SUCCESS"
+                    count=$((count + 1))
+                else
+                    print_to_terminal "Failed to delete: $filepath" "ERROR"
+                    errors=$((errors + 1))
+                fi
+            fi
+        done < "$TEMP_DELETE_LIST"
         
-        if [[ "$ARG_BACKUP_SET" -eq 1 ]] && [[ -n "$ARG_BACKUP_DIR" ]]; then
-            BACKUP_DIR="$ARG_BACKUP_DIR"
-            print_to_terminal "Using backup-dir from arguments: $BACKUP_DIR" "DEBUG"
-        elif [[ -z "${BACKUP_DIR:-}" ]]; then
-            BACKUP_DIR="/home/backup/deleted_files"
-            print_to_terminal "Using default backup-dir: $BACKUP_DIR" "DEBUG"
-        fi
-        
-        if [[ "$ARG_LOG_ROTATE_SET" -eq 1 ]]; then
-            AUTO_ROTATE_LOG="$ARG_AUTO_ROTATE_LOG"
-            print_to_terminal "Using log-rotate from arguments: $AUTO_ROTATE_LOG" "DEBUG"
-        elif [[ -z "${AUTO_ROTATE_LOG:-}" ]] || ! [[ "$AUTO_ROTATE_LOG" =~ ^[0-1]$ ]]; then
-            AUTO_ROTATE_LOG=1
-            print_to_terminal "Using default log-rotate: $AUTO_ROTATE_LOG" "DEBUG"
-        fi
-        
-        if [[ -z "${MAX_LOG_SIZE_MB:-}" ]] || ! [[ "$MAX_LOG_SIZE_MB" =~ ^[0-9]+$ ]]; then
-            MAX_LOG_SIZE_MB=50
-            print_to_terminal "Using default max-log-size: $MAX_LOG_SIZE_MB" "DEBUG"
-        fi
-        
+        print_to_terminal "=== AGE BASED CLEANUP COMPLETE ===" "SUCCESS"
+        print_to_terminal "Files deleted: $count" "INFO"
+        print_to_terminal "Errors: $errors" "INFO"
+        print_to_terminal "Remaining eligible files: $((total_eligible - count))" "INFO"
     else
-        print_to_terminal "Config file $CONFIG_FILE not found, using default values" "INFO"
+        print_to_terminal "No files selected for deletion" "INFO"
     fi
     
-    print_to_terminal "Active Configuration:" "INFO"
-    print_to_terminal "  Directory: $DIRECTORY" "INFO"
-    print_to_terminal "  Threshold: ${THRESHOLD}%" "INFO"
-    print_to_terminal "  Min Files/Dir: $MIN_FILE_COUNT" "INFO"
-    print_to_terminal "  Max Delete/Run: $MAX_DELETE_PER_RUN" "INFO"
-    print_to_terminal "  Backup Enabled: $([ "$BACKUP_ENABLED" -eq 1 ] && echo "YES ($BACKUP_DIR)" || echo "NO")" "INFO"
-    print_to_terminal "  Log File: $LOG_FILE (Max: ${MAX_LOG_SIZE_MB}MB)" "INFO"
-    print_to_terminal "  Auto Log Rotation: $([ "$AUTO_ROTATE_LOG" -eq 1 ] && echo "YES" || echo "NO")" "INFO"
-    print_to_terminal "  Lock File: $LOCK_FILE" "INFO"
+    return 0
 }
 
 # =======================
-# VALIDASI RHEL 9
+# SUPPORTING FUNCTIONS
 # =======================
-check_rhel9_compatibility() {
-    if [[ -f /etc/redhat-release ]]; then
-        local rhel_version
-        rhel_version=$(grep -oE '[0-9]+\.[0-9]+' /etc/redhat-release 2>/dev/null || echo "0")
-        local major_version=${rhel_version%%.*}
-        
-        if [[ "$major_version" -lt 9 ]]; then
-            echo "WARNING: Script dioptimasi untuk RHEL 9, versi terdeteksi: $rhel_version"
-        fi
-    fi
+generate_all_files_list() {
+    print_to_terminal "Generating file list (sorted by age, oldest first)..." "INFO"
     
-    if (( BASH_VERSINFO[0] < 4 )); then
-        echo "Error: Membutuhkan bash 4.0+, versi saat ini: ${BASH_VERSION}"
-        exit 1
-    fi
-    
-    local required_tools=("find" "sort" "stat" "df" "awk" "mkdir" "rm" "cp")
-    for tool in "${required_tools[@]}"; do
-        if ! command -v "$tool" >/dev/null 2>&1; then
-            echo "Error: Tool '$tool' tidak ditemukan"
-            exit 1
-        fi
-    done
-}
-
-# =======================
-# LOGIKA UTAMA (BATCH PROCESS)
-# =======================
-generate_delete_list() {
-    print_to_terminal "STEP 2: Mengumpulkan dan mengurutkan file..." "INFO"
-    
-    # Build find command menggunakan array
     local find_args=("$DIRECTORY" "-type" "f")
     
-    # Exclude patterns
     find_args+=("!" "-path" "$LOG_FILE")
     find_args+=("!" "-path" "$LOG_FILE.old")
     find_args+=("!" "-path" "$LOCK_FILE")
@@ -813,10 +849,7 @@ generate_delete_list() {
         find_args+=("!" "-path" "$BACKUP_DIR/*")
     fi
     
-    find_args+=("!" "-path" "*/cdr-cleanup.*.all.*")
-    find_args+=("!" "-path" "*/cdr-cleanup.*.delete.*")
-    find_args+=("!" "-path" "/tmp/cdr-cleanup.*")
-    find_args+=("!" "-path" "/var/tmp/cdr-cleanup.*")
+    find_args+=("!" "-path" "*/cdr-cleanup.*")
     
     find_args+=("!" "-name" "*.tmp")
     find_args+=("!" "-name" "temp*")
@@ -837,16 +870,8 @@ generate_delete_list() {
         find_args+=("!" "-name" "${pattern}")
     done
     
-    if [[ "$DEBUG_MODE" -eq 1 ]]; then
-        print_to_terminal "Debug: Find command: find ${find_args[*]}" "DEBUG"
-    fi
-    
-    print_to_terminal "Menjalankan find command..." "INFO"
-    
     if ! LC_ALL=C find "${find_args[@]}" -printf '%T@|%p\n' 2>/dev/null | \
         sort -t'|' -k1,1n > "$TEMP_ALL_FILES"; then
-        
-        print_to_terminal "Error: Gagal menjalankan find command" "ERROR"
         return 1
     fi
 
@@ -854,285 +879,139 @@ generate_delete_list() {
     total_found=$(wc -l < "$TEMP_ALL_FILES" 2>/dev/null || echo 0)
     
     if [[ "$total_found" -eq 0 ]]; then
-        print_to_terminal "Tidak ada file yang ditemukan (setelah exclude patterns)" "INFO"
+        print_to_terminal "No files found (after exclude patterns)" "INFO"
         return 0
     fi
     
-    print_to_terminal "Total file ditemukan (setelah exclude): $total_found" "INFO"
+    print_to_terminal "Total files found: $total_found" "INFO"
     
-    print_to_terminal "Menganalisis struktur directory..." "INFO"
-    declare -A dir_counts
-    
+    # Initialize directory counts
     while IFS='|' read -r _ filepath; do
         local dirname=$(dirname "$filepath")
-        dir_counts["$dirname"]=$(( ${dir_counts["$dirname"]:-0} + 1 ))
-        DIR_COUNTS_CACHE["$dirname"]=${dir_counts["$dirname"]}
+        DIR_COUNTS_CACHE["$dirname"]=$(( ${DIR_COUNTS_CACHE["$dirname"]:-0} + 1 ))
     done < "$TEMP_ALL_FILES"
-
-    print_to_terminal "STEP 3 & 4: Memfilter list berdasarkan kriteria..." "INFO"
     
-    local files_marked_for_delete=0
-    local current_time=$(date +%s)
-    local cutoff_time=$((current_time - (FILE_AGE_DAYS * 86400)))
+    return 0
+}
 
-    while IFS='|' read -r timestamp_str filepath; do
-        if [[ "$files_marked_for_delete" -ge "$MAX_DELETE_PER_RUN" ]]; then
-            print_to_terminal "Mencapai batas MAX_DELETE ($MAX_DELETE_PER_RUN), berhenti mencari kandidat." "INFO"
-            break
-        fi
-
+get_next_batch() {
+    local batch_size="$1"
+    local processed=0
+    
+    > "$TEMP_BATCH_LIST"
+    
+    while IFS='|' read -r timestamp_str filepath && [[ $processed -lt $batch_size ]]; do
         local dirname=$(dirname "$filepath")
-        local current_count=${dir_counts["$dirname"]:-0}
+        local current_count=${DIR_COUNTS_CACHE["$dirname"]:-0}
         
-        local file_ts
-        if [[ "$timestamp_str" =~ ^[0-9]+\.?[0-9]*$ ]]; then
-            file_ts=$(printf "%.0f" "$timestamp_str")
-        else
-            file_ts=${timestamp_str%%.*}
-        fi
-        
-        local should_delete=0
-
         if [[ "$current_count" -le "$MIN_FILE_COUNT" ]]; then
             continue
         fi
-
-        if [[ "$ENABLE_AGE_BASED_CLEANUP" -eq 0 ]]; then
-            should_delete=1
-        else
-            if [[ "$file_ts" -lt "$cutoff_time" ]]; then
-                should_delete=1
-            fi
-        fi
-
-        if [[ "$should_delete" -eq 1 ]]; then
-            echo "$filepath" >> "$TEMP_DELETE_LIST"
-            dir_counts["$dirname"]=$((current_count - 1))
-            DIR_COUNTS_CACHE["$dirname"]=$((current_count - 1))
-            files_marked_for_delete=$((files_marked_for_delete + 1))
-            
-            if [[ "$DEBUG_MODE" -eq 1 ]]; then
-                local file_age=$(( (current_time - file_ts) / 86400 ))
-                print_to_terminal "Debug: Mark for deletion - $filepath (Age: ${file_age}d)" "DEBUG"
-            fi
-        fi
-
+        
+        echo "$filepath" >> "$TEMP_BATCH_LIST"
+        DIR_COUNTS_CACHE["$dirname"]=$((current_count - 1))
+        processed=$((processed + 1))
     done < "$TEMP_ALL_FILES"
     
-    print_to_terminal "File yang akan dihapus: $files_marked_for_delete" "INFO"
+    # Remove processed lines
+    if [[ $processed -gt 0 ]]; then
+        sed -i "1,${processed}d" "$TEMP_ALL_FILES"
+    fi
+    
+    echo "$processed"
 }
 
-execute_cleanup() {
-    print_to_terminal "STEP 5: Menghapus file yang sudah masuk list..." "INFO"
-
-    if [[ ! -s "$TEMP_DELETE_LIST" ]]; then
-        print_to_terminal "Tidak ada file yang perlu dihapus." "SUCCESS"
-        return 0
-    fi
-
+delete_batch() {
     local count=0
-    local errors=0
-
+    
     while read -r filepath; do
         if [[ "$DRY_RUN" -eq 1 ]]; then
             local age_days=$(get_file_age_days "$filepath")
             print_to_terminal "Would delete: $filepath (Age: $age_days days)" "DRY_RUN"
             count=$((count + 1))
         else
-            if safe_delete "$filepath"; then
+            if rm -f -- "$filepath"; then
+                print_to_terminal "Deleted: $filepath" "SUCCESS"
                 count=$((count + 1))
             else
-                errors=$((errors + 1))
+                print_to_terminal "Failed to delete: $filepath" "ERROR"
             fi
         fi
-    done < "$TEMP_DELETE_LIST"
-
-    print_to_terminal "Total diproses: $count file. Error: $errors" "INFO"
-}
-
-# =======================
-# LOCK FILE HANDLING
-# =======================
-acquire_lock() {
-    local lock_file="$1"
-    local lock_dir="$(dirname "$lock_file")"
+    done < "$TEMP_BATCH_LIST"
     
-    mkdir -p "$lock_dir" 2>/dev/null || true
-    
-    if ! ( set -o noclobber; echo "$$" > "$lock_file" ) 2>/dev/null; then
-        if [[ -f "$lock_file" ]]; then
-            local pid
-            pid=$(cat "$lock_file" 2>/dev/null || echo "")
-            
-            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-                print_to_terminal "Script sudah berjalan dengan PID: $pid" "ERROR"
-                return 1
-            else
-                print_to_terminal "Cleaning stale lock file (PID: ${pid:-unknown})" "WARNING"
-                rm -f "$lock_file"
-                
-                if ! ( set -o noclobber; echo "$$" > "$lock_file" ) 2>/dev/null; then
-                    print_to_terminal "Failed to acquire lock after cleanup" "ERROR"
-                    return 1
-                fi
-            fi
-        else
-            print_to_terminal "Failed to acquire lock" "ERROR"
-            return 1
-        fi
-    fi
-    
-    print_to_terminal "Lock acquired: $lock_file (PID: $$)" "DEBUG"
-    return 0
+    echo "$count"
 }
 
 # =======================
 # MAIN SCRIPT
 # =======================
 main() {
-    # Buat log directory pertama kali
     mkdir -p "/var/log/cdr-cleanup" 2>/dev/null || {
         echo "Error: Cannot create log directory /var/log/cdr-cleanup"
         exit 1
     }
     
-    # Banner
     echo "=== CDR CLEANUP UTILITY FOR RHEL 9 ==="
     echo "Config: $CONFIG_FILE | Log: $LOG_FILE"
     
-    # Start logging
     print_to_terminal "=========================================" "HEADER"
     print_to_terminal "🚀 CDR CLEANUP STARTED" "HEADER"
     print_to_terminal "Timestamp: $(get_timestamp_ms)" "INFO"
     print_to_terminal "Arguments: $*" "INFO"
-    print_to_terminal "PID: $$" "INFO"
-    print_to_terminal "User: $(whoami)" "INFO"
-    print_to_terminal "Hostname: $(hostname)" "INFO"
-    print_to_terminal "Script: $(realpath "$0" 2>/dev/null || echo "$0")" "INFO"
-    print_to_terminal "Config File: $CONFIG_FILE" "INFO"
-    print_to_terminal "Log File: $LOG_FILE (Max: ${MAX_LOG_SIZE_MB}MB)" "INFO"
     print_to_terminal "=========================================" "HEADER"
     
     SCRIPT_START_TIME=$(date +%s)
     
-    # Parse arguments
-    print_to_terminal "STEP 1: Parsing command line arguments..." "INFO"
+    # 1. Parse arguments terlebih dahulu
     parse_arguments "$@"
     
-    # Load configuration
-    load_config
+    # 2. Load config file dengan prioritas yang benar
+    load_config_file "$CONFIG_FILE"
     
-    # Check log rotation
-    print_to_terminal "Checking log file size..." "INFO"
+    # 3. Check log rotation
     check_and_rotate_log "$LOG_FILE"
     
-    # Acquire lock
-    if ! acquire_lock "$LOCK_FILE"; then
-        print_to_terminal "Cannot proceed, another instance is running or lock issue" "ERROR"
+    # 4. Set MODE dan tampilkan info
+    if [[ "$MODE" == "DISK_THRESHOLD" ]]; then
+        print_to_terminal "Mode: DISK THRESHOLD (Target: <${THRESHOLD}%)" "INFO"
+        # Pastikan age-based cleanup disabled
+        ENABLE_AGE_BASED_CLEANUP=0
+    elif [[ "$MODE" == "AGE_DAYS" ]]; then
+        print_to_terminal "Mode: AGE DAYS (Older than ${FILE_AGE_DAYS} days)" "INFO"
+        ENABLE_AGE_BASED_CLEANUP=1
+    elif [[ "$MODE" == "AGE_MONTHS" ]]; then
+        print_to_terminal "Mode: AGE MONTHS (Older than ${FILE_AGE_DAYS} days)" "INFO"
+        ENABLE_AGE_BASED_CLEANUP=1
+    fi
+    
+    # 5. Validasi directory
+    if [[ ! -d "$DIRECTORY" ]]; then
+        print_to_terminal "Error: Directory '$DIRECTORY' tidak ditemukan" "ERROR"
         exit 1
     fi
     
-    # Check compatibility
-    check_rhel9_compatibility
+    print_to_terminal "Target directory: $DIRECTORY" "INFO"
+    print_to_terminal "Mode: $MODE" "INFO"
     
-    # Validate inputs
-    validate_integer "$THRESHOLD" "THRESHOLD" 1 100
-    validate_integer "$MIN_FILE_COUNT" "MIN_FILE_COUNT" 0 100000
-    validate_integer "$MAX_DELETE_PER_RUN" "MAX_DELETE_PER_RUN" 1 10000
-    
-    # Debug configuration
-    print_to_terminal "Final Configuration Values:" "INFO"
-    print_to_terminal "  MAX_DELETE_PER_RUN: $MAX_DELETE_PER_RUN" "INFO"
-    print_to_terminal "  DIRECTORY: $DIRECTORY" "INFO"
-    print_to_terminal "  THRESHOLD: $THRESHOLD" "INFO"
-    print_to_terminal "  MIN_FILE_COUNT: $MIN_FILE_COUNT" "INFO"
-    print_to_terminal "  BACKUP_ENABLED: $BACKUP_ENABLED" "INFO"
-    print_to_terminal "  FILE_AGE_DAYS: $FILE_AGE_DAYS" "INFO"
-    print_to_terminal "  ENABLE_AGE_BASED_CLEANUP: $ENABLE_AGE_BASED_CLEANUP" "INFO"
-    
-    # Cleanup old logs
-    cleanup_old_logs
-    
-    # Validate directory
-    validate_directory "$DIRECTORY"
-    check_security_files "$DIRECTORY"
-    
-    # Determine mode
-    if [[ "$ENABLE_AGE_BASED_CLEANUP" -eq 1 ]]; then
-        print_to_terminal "MODE: AGE BASED (Older than $FILE_AGE_DAYS days)" "HEADER"
-        print_to_terminal "Logic: Search files > Age Limit, Keep Min $MIN_FILE_COUNT per dir, Max Delete $MAX_DELETE_PER_RUN" "INFO"
-        
-        generate_delete_list
-        execute_cleanup
+    # 6. Execute based on mode
+    if [[ "$MODE" == "DISK_THRESHOLD" ]]; then
+        perform_disk_threshold_cleanup
+    elif [[ "$MODE" == "AGE_DAYS" ]] || [[ "$MODE" == "AGE_MONTHS" ]]; then
+        perform_age_based_cleanup
     else
-        local current_usage
-        current_usage=$(get_disk_usage "$DIRECTORY")
-        
-        if [[ -z "$current_usage" ]] || ! [[ "$current_usage" =~ ^[0-9]+$ ]]; then
-            print_to_terminal "Error: Gagal mendapatkan disk usage untuk $DIRECTORY" "ERROR"
-            exit 1
-        fi
-        
-        print_to_terminal "MODE: DISK THRESHOLD (Current: ${current_usage}%, Threshold: $THRESHOLD%)" "HEADER"
-        print_to_terminal "Logic: Remove oldest files until threshold safe or max limit reached." "INFO"
-
-        if [[ "$current_usage" -ge "$THRESHOLD" ]]; then
-            print_to_terminal "Disk usage ($current_usage%) > Threshold ($THRESHOLD%). Memulai cleanup..." "WARNING"
-            generate_delete_list
-            execute_cleanup
-            
-            local new_usage
-            new_usage=$(get_disk_usage "$DIRECTORY")
-            if [[ -n "$new_usage" ]] && [[ "$new_usage" =~ ^[0-9]+$ ]]; then
-                print_to_terminal "Disk usage after cleanup: $new_usage%" "INFO"
-                print_to_terminal "Reduction: $((current_usage - new_usage))%" "INFO"
-            fi
-        else
-            print_to_terminal "Disk usage aman ($current_usage% < $THRESHOLD%). Tidak ada aksi." "SUCCESS"
-        fi
+        print_to_terminal "Error: Unknown mode '$MODE'" "ERROR"
+        exit 1
     fi
     
-    # Completion log
+    # 7. Completion
     SCRIPT_END_TIME=$(date +%s)
     local DURATION=$((SCRIPT_END_TIME - SCRIPT_START_TIME))
     
-    print_to_terminal "Cleanup process completed" "SUCCESS"
-    
-    # Log size info
-    if [[ -f "$LOG_FILE" ]]; then
-        local log_size_bytes
-        log_size_bytes=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
-        local log_size_mb=$((log_size_bytes / 1024 / 1024))
-        local log_size_percent=0
-        
-        if [[ "$MAX_LOG_SIZE_MB" -gt 0 ]]; then
-            log_size_percent=$(( (log_size_bytes * 100) / (MAX_LOG_SIZE_MB * 1024 * 1024) ))
-        fi
-        
-        print_to_terminal "Log file size: ${log_size_mb}MB (${log_size_percent}% of ${MAX_LOG_SIZE_MB}MB limit)" "INFO"
-    fi
-    
     print_to_terminal "=========================================" "HEADER"
-    print_to_terminal "✅ CDR CLEANUP COMPLETED" "HEADER"
-    print_to_terminal "Completion Time: $(get_timestamp_ms)" "INFO"
+    print_to_terminal "✅ CLEANUP COMPLETED" "HEADER"
     print_to_terminal "Total Duration: ${DURATION} seconds" "INFO"
-    print_to_terminal "Start Time: $(date -d "@$SCRIPT_START_TIME" '+%F %T' 2>/dev/null || echo "$SCRIPT_START_TIME")" "INFO"
-    print_to_terminal "End Time: $(date -d "@$SCRIPT_END_TIME" '+%F %T' 2>/dev/null || echo "$SCRIPT_END_TIME")" "INFO"
-    
-    # Summary
-    print_to_terminal "--- SUMMARY ---" "INFO"
-    print_to_terminal "Mode: $([ "$ENABLE_AGE_BASED_CLEANUP" -eq 1 ] && echo "AGE-BASED ($FILE_AGE_DAYS days)" || echo "DISK-THRESHOLD ($THRESHOLD%)")" "INFO"
-    print_to_terminal "Directory: $DIRECTORY" "INFO"
-    print_to_terminal "Dry Run: $([ "$DRY_RUN" -eq 1 ] && echo "YES" || echo "NO")" "INFO"
-    print_to_terminal "Backup Enabled: $([ "$BACKUP_ENABLED" -eq 1 ] && echo "YES" || echo "NO")" "INFO"
-    print_to_terminal "Debug Mode: $([ "$DEBUG_MODE" -eq 1 ] && echo "YES" || echo "NO")" "INFO"
-    print_to_terminal "Include Hidden: $([ "$INCLUDE_HIDDEN" -eq 1 ] && echo "YES" || echo "NO")" "INFO"
-    print_to_terminal "Auto Log Rotation: $([ "$AUTO_ROTATE_LOG" -eq 1 ] && echo "YES" || echo "NO")" "INFO"
-    print_to_terminal "Max Delete Per Run: $MAX_DELETE_PER_RUN" "INFO"
-    print_to_terminal "Min Files Per Dir: $MIN_FILE_COUNT" "INFO"
-    
-    # Release lock
-    rm -f "$LOCK_FILE" 2>/dev/null
+    print_to_terminal "Mode: $MODE" "INFO"
+    print_to_terminal "=========================================" "HEADER"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
