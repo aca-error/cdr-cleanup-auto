@@ -1,738 +1,863 @@
 #!/bin/bash
-# CDR Cleanup Utility Installation Script
-# ========================================
-# Install script untuk cdr-cleanup utility di RHEL 9
+set -o errexit -o nounset -o pipefail
 
-set -o nounset -o pipefail -o errexit
+# ============================================
+# CONFIGURATION
+# ============================================
+SCRIPT_NAME="install-cdr-full.sh"
+VERSION="4.0"
+AUTHOR="CDR Management Team"
 
-# Colors for output
+# Main script (harus ada di direktori yang sama)
+MAIN_SCRIPT_NAME="cdr-cleanup"
+MAIN_SCRIPT_SOURCE="./${MAIN_SCRIPT_NAME}.sh"
+INSTALL_DIR="/usr/local/bin"
+INSTALL_PATH="${INSTALL_DIR}/${MAIN_SCRIPT_NAME}"
+
+# Paths untuk semua komponen
+CONFIG_FILE="/etc/${MAIN_SCRIPT_NAME}.conf"
+CONFIG_EXAMPLE="/etc/${MAIN_SCRIPT_NAME}.conf.example"
+LOG_DIR="/var/log/${MAIN_SCRIPT_NAME}"
+LOG_FILE="${LOG_DIR}/${MAIN_SCRIPT_NAME}.log"
+LOCK_FILE="/var/lock/${MAIN_SCRIPT_NAME}.lock"
+LOGROTATE_FILE="/etc/logrotate.d/${MAIN_SCRIPT_NAME}"
+SYSTEMD_SERVICE="/etc/systemd/system/${MAIN_SCRIPT_NAME}.service"
+SYSTEMD_TIMER="/etc/systemd/system/${MAIN_SCRIPT_NAME}.timer"
+MAN_PAGE="/usr/share/man/man1/${MAIN_SCRIPT_NAME}.1.gz"
+BACKUP_DIR="/home/backup/deleted_files"
+DOC_DIR="/usr/local/share/doc/${MAIN_SCRIPT_NAME}"
+
+# ============================================
+# COLOR FUNCTIONS
+# ============================================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
+YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
 NC='\033[0m' # No Color
 
-print_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+print_header() {
+    echo -e "${BLUE}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║${WHITE} $1${NC}"
+    echo -e "${BLUE}╚══════════════════════════════════════════════════════════╝${NC}"
 }
 
 print_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
-}
-
-print_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
+    echo -e "${GREEN}✓${NC} $1"
 }
 
 print_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    echo -e "${RED}✗${NC} Error: $1"
 }
 
+print_warning() {
+    echo -e "${YELLOW}⚠${NC} $1"
+}
+
+print_info() {
+    echo -e "${CYAN}➜${NC} $1"
+}
+
+print_step() {
+    echo -e "${PURPLE}▶${NC} $1"
+}
+
+# ============================================
+# VALIDATION FUNCTIONS
+# ============================================
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        print_error "Script ini harus dijalankan sebagai root"
-        echo "Gunakan: sudo $0"
+        print_error "Script ini memerlukan hak akses root"
+        echo -e "Gunakan: ${CYAN}sudo $0${NC}"
         exit 1
     fi
 }
 
-check_rhel9() {
+check_main_script() {
+    if [[ ! -f "$MAIN_SCRIPT_SOURCE" ]]; then
+        print_error "File script utama tidak ditemukan: $MAIN_SCRIPT_SOURCE"
+        echo ""
+        echo "Pastikan file berikut ada di direktori yang sama:"
+        echo "  - cdr-cleanup.sh (script utama)"
+        echo "  - $0 (installer ini)"
+        echo ""
+        exit 1
+    fi
+    
+    # Validasi script syntax
+    if ! bash -n "$MAIN_SCRIPT_SOURCE" 2>/dev/null; then
+        print_error "Script utama memiliki syntax error"
+        exit 1
+    fi
+}
+
+check_system() {
+    print_info "Checking system compatibility..."
+    
+    # Check OS
     if [[ -f /etc/redhat-release ]]; then
-        local rhel_version
-        rhel_version=$(grep -oE '[0-9]+\.[0-9]+' /etc/redhat-release 2>/dev/null || echo "0")
-        local major_version=${rhel_version%%.*}
-        
-        if [[ "$major_version" -lt 9 ]]; then
-            print_warning "Script dioptimasi untuk RHEL 9, versi terdeteksi: $rhel_version"
-            read -p "Lanjutkan installasi? (y/N): " -n 1 -r
-            echo
-            [[ ! $REPLY =~ ^[Yy]$ ]] && exit 1
-        fi
+        local os_version
+        os_version=$(grep -o '[0-9]' /etc/redhat-release | head -1)
+        print_success "OS: RHEL/CentOS $(cat /etc/redhat-release)"
     else
-        print_warning "Sistem operasi bukan RHEL/CentOS. Lanjutkan dengan hati-hati."
-        read -p "Lanjutkan installasi? (y/N): " -n 1 -r
-        echo
-        [[ ! $REPLY =~ ^[Yy]$ ]] && exit 1
+        print_warning "OS: Non-RHEL system, compatibility not guaranteed"
     fi
-}
-
-check_dependencies() {
-    print_info "Checking dependencies..."
     
-    local missing_deps=()
-    local required_tools=("bash" "find" "sort" "stat" "df" "awk" "mkdir" "rm" "cp" "gzip")
+    # Check required commands
+    local required_cmds=("bash" "find" "rm" "df" "stat" "mkdir" "gzip")
+    local missing=()
     
-    for tool in "${required_tools[@]}"; do
-        if ! command -v "$tool" >/dev/null 2>&1; then
-            missing_deps+=("$tool")
+    for cmd in "${required_cmds[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
         fi
     done
     
-    if [[ ${#missing_deps[@]} -gt 0 ]]; then
-        print_error "Dependencies missing: ${missing_deps[*]}"
-        echo "Install dengan: dnf install ${missing_deps[*]}"
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        print_error "Missing required commands: ${missing[*]}"
         exit 1
     fi
     
-    print_success "All dependencies satisfied"
+    print_success "System check passed"
 }
 
-create_directories() {
-    print_info "Creating necessary directories..."
-    
-    local directories=(
-        "/var/log/cdr-cleanup"
-        "/home/cdrsbx"
-        "/home/backup/deleted_files"
-        "/usr/local/bin"
-        "/usr/local/share/man/man1"
-        "/etc"
-    )
-    
-    for dir in "${directories[@]}"; do
-        if [[ ! -d "$dir" ]]; then
-            mkdir -p "$dir"
-            print_info "Created directory: $dir"
-        fi
-    done
-    
-    # Set permissions
-    chmod 755 /var/log/cdr-cleanup
-    chmod 755 /home/cdrsbx
-    chmod 700 /home/backup/deleted_files
-    chmod 755 /usr/local/share/man/man1
-    
-    print_success "Directories created and permissions set"
-}
-
+# ============================================
+# INSTALLATION FUNCTIONS
+# ============================================
 install_main_script() {
-    print_info "Installing main script..."
+    print_step "Installing main script..."
     
-    local script_source="cdr-cleanup.sh"
-    
-    if [[ ! -f "$script_source" ]]; then
-        print_error "Main script not found: $script_source"
-        print_error "Pastikan file cdr-cleanup.sh berada di directory yang sama"
-        exit 1
+    if [[ ! -d "$INSTALL_DIR" ]]; then
+        mkdir -p "$INSTALL_DIR"
     fi
     
-    # Copy script
-    cp "$script_source" /usr/local/bin/cdr-cleanup
-    chmod 755 /usr/local/bin/cdr-cleanup
-    chown root:root /usr/local/bin/cdr-cleanup
+    # Backup existing script if any
+    if [[ -f "$INSTALL_PATH" ]]; then
+        mv "$INSTALL_PATH" "${INSTALL_PATH}.backup.$(date +%Y%m%d)"
+        print_info "Backed up existing script to ${INSTALL_PATH}.backup.$(date +%Y%m%d)"
+    fi
     
-    # Verify installation
-    if [[ -x /usr/local/bin/cdr-cleanup ]]; then
-        print_success "Main script installed: /usr/local/bin/cdr-cleanup"
+    # Install script
+    cp "$MAIN_SCRIPT_SOURCE" "$INSTALL_PATH"
+    chmod 755 "$INSTALL_PATH"
+    
+    if [[ -x "$INSTALL_PATH" ]]; then
+        print_success "Main script installed: $INSTALL_PATH"
+        
+        # Test basic functionality
+        if "$INSTALL_PATH" --help &>/dev/null; then
+            print_success "Script test passed"
+        else
+            print_warning "Script help test failed (but installed)"
+        fi
     else
         print_error "Failed to install main script"
         exit 1
     fi
 }
 
-install_config_file() {
-    print_info "Installing config file..."
+create_config_file() {
+    print_step "Creating configuration file..."
     
-    cat > /etc/cdr-cleanup.conf << 'EOF'
-#!/bin/bash
-# CDR Cleanup Configuration File
-# ==============================
-# Semua variabel di sini akan di-load oleh cdr-cleanup.sh
+    cat > "$CONFIG_FILE" << 'EOF'
+# ====================================================
+# CDR CLEANUP CONFIGURATION FILE
+# ====================================================
+# This file is sourced by cdr-cleanup script
+# Command line arguments override these values
+# ====================================================
 
-# Direktori target untuk cleanup
+# [TARGET SETTINGS]
+# Directory to clean up
 DIRECTORY="/home/cdrsbx"
 
-# Threshold disk usage (1-100%)
+# [CLEANUP MODE SETTINGS]
+# Mode 1: Disk Threshold (1-100%)
+# Default mode when using --threshold
 THRESHOLD=85
 
-# Minimum file count per directory
-MIN_FILE_COUNT=30
+# Mode 2: Age Based (days)
+# Used with --age-days or --age-months
+FILE_AGE_DAYS=180
 
-# Maximum files to delete per run
+# [SAFETY LIMITS]
+# Maximum files to delete per execution (1-10000)
 MAX_DELETE_PER_RUN=100
 
-# Backup enabled (0=disabled, 1=enabled)
+# Minimum files to keep per directory (0-100000)
+MIN_FILE_COUNT=30
+
+# [BACKUP SETTINGS]
+# Enable backup before deletion (0=no, 1=yes)
 BACKUP_ENABLED=0
 
-# Backup directory
+# Directory for backups
 BACKUP_DIR="/home/backup/deleted_files"
 
-# Log file max size in MB (for auto rotation)
+# [LOGGING SETTINGS]
+# Enable automatic log rotation (0=no, 1=yes)
+AUTO_ROTATE_LOG=1
+
+# Maximum log file size in MB before rotation
 MAX_LOG_SIZE_MB=50
 
-# Enable auto log rotation (0=disabled, 1=enabled)
-AUTO_ROTATE_LOG=1
+# [DEBUG SETTINGS]
+# Enable debug mode (0=no, 1=yes)
+DEBUG_MODE=0
+
+# [EXCLUDE PATTERNS]
+# Additional exclude patterns (bash array format)
+# USER_EXCLUDE_PATTERNS=("*.log" "*.tmp" "temp_*")
+
+# ====================================================
+# NOTES:
+# 1. Command line arguments have highest priority
+# 2. THRESHOLD and AGE modes are mutually exclusive
+# 3. Set proper permissions on directories
+# ====================================================
 EOF
     
-    chmod 600 /etc/cdr-cleanup.conf
-    chown root:root /etc/cdr-cleanup.conf
+    chmod 644 "$CONFIG_FILE"
+    print_success "Config file created: $CONFIG_FILE"
     
-    if [[ -f /etc/cdr-cleanup.conf ]]; then
-        print_success "Config file installed: /etc/cdr-cleanup.conf"
-    else
-        print_error "Failed to install config file"
-        exit 1
-    fi
+    # Create example config
+    cp "$CONFIG_FILE" "$CONFIG_EXAMPLE"
+    print_success "Example config created: $CONFIG_EXAMPLE"
 }
 
-install_man_page() {
-    print_info "Installing man page..."
+setup_logging() {
+    print_step "Setting up logging system..."
     
-    local man_page_content=$(cat << 'MAN_PAGE_EOF'
-.TH CDR\-CLEANUP 1 "January 2024" "CDR Cleanup Utility v1.0"
-.SH NAME
-cdr\-cleanup \- Disk cleanup utility for RHEL 9
-.SH SYNOPSIS
-.B cdr\-cleanup
-[\fIOPTIONS\fR]
-.SH DESCRIPTION
-.B cdr\-cleanup
-is a bash script utility designed specifically for Red Hat Enterprise Linux 9
-that helps manage disk usage by automatically removing old files based on disk
-threshold or file age, with comprehensive safety features and logging.
-.PP
-The utility operates in two main modes:
-.IP \(bu 3
-\fBDisk Threshold Mode\fR: Removes oldest files when disk usage exceeds a
-configurable threshold percentage.
-.IP \(bu 3
-\fBAge\-Based Mode\fR: Removes files older than a specified number of days or
-months, regardless of current disk usage.
-.PP
-The script includes multiple safety mechanisms such as minimum file count
-protection per directory, exclusion of hidden files and system directories,
-SELinux context preservation, and comprehensive logging with automatic
-rotation.
-.SH OPTIONS
-.TP
-.B \-\-dry\-run
-Simulation mode only, no files will be deleted (Default).
-.TP
-.B \-\-force
-Execute actual file deletion (overrides dry\-run).
-.TP
-.B \-\-threshold=\fIN\fR
-Set disk usage threshold percentage (1\-100). Default: 85.
-Only applies to Disk Threshold mode.
-.TP
-.B \-\-age\-days=\fIN\fR
-Delete files older than N days. Activates Age\-Based mode.
-.TP
-.B \-\-age\-months=\fIN\fR
-Delete files older than N months. Activates Age\-Based mode.
-.TP
-.B \-\-directory=\fIPATH\fR
-Target directory for cleanup. Default: /home/cdrsbx.
-.TP
-.B \-\-min\-files=\fIN\fR
-Minimum number of files to keep per directory. Default: 30.
-.TP
-.B \-\-max\-delete=\fIN\fR
-Maximum number of files to delete per execution. Default: 100.
-.TP
-.B \-\-exclude=\fIPATTERN\fR
-Additional exclusion pattern (can be used multiple times).
-.TP
-.B \-\-include\-hidden
-Include hidden files/directories (NOT RECOMMENDED).
-.TP
-.B \-\-backup
-Enable backup before deletion.
-.TP
-.B \-\-no\-backup
-Disable backup (overrides config).
-.TP
-.B \-\-debug
-Show debug messages to terminal.
-.TP
-.B \-\-quiet
-Suppress all terminal output (still logs to file).
-.TP
-.B \-\-config=\fIFILE\fR
-Use alternative config file.
-.TP
-.B \-\-no\-log\-rotate
-Disable auto log rotation for this run.
-.TP
-.B \-\-help
-Display this help message.
-.SH CONFIGURATION
-The main configuration file is
-.I /etc/cdr\-cleanup.conf
-which is sourced by the script. This file contains default values for:
-.IP \(bu 3
-DIRECTORY: Target directory
-.IP \(bu 3
-THRESHOLD: Disk usage percentage threshold
-.IP \(bu 3
-MIN_FILE_COUNT: Minimum files per directory
-.IP \(bu 3
-MAX_DELETE_PER_RUN: Maximum deletions per execution
-.IP \(bu 3
-BACKUP_ENABLED: Backup toggle (0/1)
-.IP \(bu 3
-BACKUP_DIR: Backup location
-.IP \(bu 3
-MAX_LOG_SIZE_MB: Log file size limit for auto rotation
-.IP \(bu 3
-AUTO_ROTATE_LOG: Auto rotation toggle (0/1)
-.PP
-Command line arguments override config file values.
-.SH EXCLUSION PATTERNS
-By default, the script excludes:
-.IP \(bu 3
-All hidden files and directories (starting with .)
-.IP \(bu 3
-Default user directories: Desktop, Documents, Downloads, Pictures, Music, Videos
-.IP \(bu 3
-Configuration directories: .config, .local, .cache, .ssh, .gnupg
-.IP \(bu 3
-Version control directories: .git, .svn, .hg
-.IP \(bu 3
-Application data: .mozilla, .thunderbird, .vscode
-.IP \(bu 3
-Shell files: .bash*, .profile, .zsh*
-.IP \(bu 3
-System directories: /, /bin, /sbin, /usr, /etc, /boot, /var
-.SH LOGGING
-The script maintains comprehensive logs at
-.I /var/log/cdr\-cleanup/cdr\-cleanup.log
-with the following features:
-.IP \(bu 3
-Automatic rotation when log reaches 50MB or monthly
-.IP \(bu 3
-Start and end timestamps with duration
-.IP \(bu 3
-Process summary and statistics
-.IP \(bu 3
-Journald integration when run under systemd
-.IP \(bu 3
-Logrotate configuration at /etc/logrotate.d/cdr\-cleanup
-.SH FILES
-.TP
-.I /usr/local/bin/cdr\-cleanup
-Main executable script.
-.TP
-.I /etc/cdr\-cleanup.conf
-Main configuration file.
-.TP
-.I /var/log/cdr\-cleanup/cdr\-cleanup.log
-Main log file.
-.TP
-.I /var/lock/cdr\-cleanup.lock
-Lock file to prevent multiple executions.
-.TP
-.I /etc/logrotate.d/cdr\-cleanup
-Log rotation configuration.
-.TP
-.I /etc/systemd/system/cdr\-cleanup.service
-Systemd service unit file.
-.TP
-.I /etc/systemd/system/cdr\-cleanup.timer
-Systemd timer unit file.
-.TP
-.I /etc/cron.d/cdr\-cleanup
-Cron job configuration.
-.SH EXAMPLES
-Delete files when disk usage exceeds 85% (dry run):
-.RS
-.PP
-.nf
-.B cdr\-cleanup \-\-dry\-run \-\-threshold=85
-.fi
-.RE
-.PP
-Force deletion of files older than 180 days:
-.RS
-.PP
-.nf
-.B cdr\-cleanup \-\-force \-\-age\-days=180
-.fi
-.RE
-.PP
-Cleanup with custom directory and debug output:
-.RS
-.PP
-.nf
-.B cdr\-cleanup \-\-force \-\-directory=/var/log \-\-threshold=80 \-\-debug
-.fi
-.RE
-.PP
-Schedule daily cleanup via systemd:
-.RS
-.PP
-.nf
-.B systemctl enable \-\-now cdr\-cleanup.timer
-.fi
-.RE
-.SH SAFETY FEATURES
-.IP \(bu 3
-Dry\-run mode is default
-.IP \(bu 3
-Minimum file count protection per directory
-.IP \(bu 3
-Exclusion of system and hidden files
-.IP \(bu 3
-Lock file to prevent concurrent execution
-.IP \(bu 3
-Comprehensive error handling and logging
-.IP \(bu 3
-User confirmation for security\-sensitive directories
-.IP \(bu 3
-SELinux context preservation for backups
-.SH EXIT STATUS
-.IP 0
-Success
-.IP 1
-General error
-.IP 2
-Invalid arguments
-.IP 3
-Permission denied
-.IP 4
-Invalid directory
-.IP 5
-Already running (lock file exists)
-.SH SEE ALSO
-.BR logrotate (8),
-.BR crontab (5),
-.BR systemd.timer (5),
-.BR find (1),
-.BR df (1)
-.SH BUGS
-Report bugs to your system administrator or create an issue at the
-project repository if available.
-.SH AUTHOR
-System Administration Team
-.SH COPYRIGHT
-Copyright © 2024 System Administration Team.
-This is free software; see the source for copying conditions.
-There is NO warranty; not even for MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE.
-MAN_PAGE_EOF
-)
+    # Create log directory
+    mkdir -p "$LOG_DIR"
     
-    # Create man page
-    echo "$man_page_content" > /usr/local/share/man/man1/cdr-cleanup.1
+    # Create log file
+    touch "$LOG_FILE"
     
-    # Compress man page
-    gzip -f /usr/local/share/man/man1/cdr-cleanup.1
+    # Set permissions
+    chmod 755 "$LOG_DIR"
+    chmod 644 "$LOG_FILE"
+    chown root:root "$LOG_DIR" "$LOG_FILE"
     
-    # Update man database
-    mandb 2>/dev/null || true
-    
-    if [[ -f /usr/local/share/man/man1/cdr-cleanup.1.gz ]]; then
-        print_success "Man page installed: /usr/local/share/man/man1/cdr-cleanup.1.gz"
-    else
-        print_error "Failed to install man page"
-        exit 1
-    fi
+    print_success "Log directory: $LOG_DIR"
+    print_success "Log file: $LOG_FILE"
 }
 
-install_logrotate_config() {
-    print_info "Installing logrotate configuration..."
+create_logrotate_config() {
+    print_step "Creating logrotate configuration..."
     
-    cat > /etc/logrotate.d/cdr-cleanup << 'EOF'
+    cat > "$LOGROTATE_FILE" << 'EOF'
+# Log rotation for CDR Cleanup Utility
 /var/log/cdr-cleanup/cdr-cleanup.log {
-    monthly                    # Rotate monthly
-    rotate 12                  # Keep 12 months of logs
-    size 50M                   # Rotate if file exceeds 50MB
-    compress                   # Compress rotated logs
-    delaycompress              # Delay compression until next rotation
-    missingok                  # Don't error if log is missing
-    notifempty                 # Don't rotate empty logs
-    create 640 root root       # Set permissions on new log file
-    dateext                    # Add date extension to rotated logs
-    dateformat -%Y%m%d        # Format: cdr-cleanup.log-20240127
-    sharedscripts              # Run postrotate script once for all logs
+    missingok               # Don't error if log file is missing
+    notifempty             # Don't rotate empty logs
+    compress               # Compress rotated logs
+    delaycompress          # Delay compression until next rotation
+    maxsize 50M            # Rotate when log reaches 50MB
+    rotate 12              # Keep 12 rotated logs
+    weekly                 # Rotate weekly
+    create 0644 root root  # Create new log with these permissions
+    
+    # Optional post-rotate commands
     postrotate
-        echo "[$(date '+%F %T')] [INFO] Logrotate executed rotation" >> /var/log/cdr-cleanup/cdr-cleanup.log 2>/dev/null || true
+        # Reload syslog if needed
+        # /bin/systemctl reload rsyslog.service > /dev/null 2>&1 || true
     endscript
 }
 EOF
     
-    chmod 644 /etc/logrotate.d/cdr-cleanup
-    
-    if [[ -f /etc/logrotate.d/cdr-cleanup ]]; then
-        print_success "Logrotate config installed: /etc/logrotate.d/cdr-cleanup"
-    else
-        print_error "Failed to install logrotate config"
-        exit 1
-    fi
+    chmod 644 "$LOGROTATE_FILE"
+    print_success "Logrotate config: $LOGROTATE_FILE"
 }
 
-install_systemd_service() {
-    print_info "Installing systemd service (optional)..."
+create_systemd_service() {
+    print_step "Creating systemd service..."
     
-    # Create service file
-    cat > /etc/systemd/system/cdr-cleanup.service << 'EOF'
+    # Service file
+    cat > "$SYSTEMD_SERVICE" << 'EOF'
 [Unit]
-Description=CDR Disk Cleanup Service
+Description=CDR Cleanup Utility
+Documentation=man:cdr-cleanup(1)
 After=network-online.target
 Wants=network-online.target
-Documentation=man:cdr-cleanup(1)
 
 [Service]
 Type=oneshot
 User=root
-EnvironmentFile=/etc/cdr-cleanup.conf
-ExecStart=/usr/local/bin/cdr-cleanup --force --threshold=${THRESHOLD}
+Group=root
+
+# Environment variables
+Environment="INVOCATION_ID=%i"
+
+# Main command
+ExecStart=/usr/local/bin/cdr-cleanup --force --threshold=85 --quiet
+
+# Post-execution logging
+ExecStartPost=/bin/sh -c 'echo "[SYSTEMD] CDR Cleanup completed at $(date)" >> /var/log/cdr-cleanup/service.log'
+
+# Safety limits
+MemoryLimit=512M
+CPUQuota=50%
+Restart=no
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/log/cdr-cleanup /var/lock
+
+# Logging
 StandardOutput=journal
 StandardError=journal
-LockPersonality=yes
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=strict
-ReadWritePaths=/home/cdrsbx /home/backup
+SyslogIdentifier=cdr-cleanup
 
 [Install]
 WantedBy=multi-user.target
 EOF
     
-    # Create timer file
-    cat > /etc/systemd/system/cdr-cleanup.timer << 'EOF'
+    # Timer file for scheduled execution
+    cat > "$SYSTEMD_TIMER" << 'EOF'
 [Unit]
-Description=Run CDR Cleanup Daily
-Requires=cdr-cleanup.service
+Description=Daily CDR Cleanup Timer
 Documentation=man:cdr-cleanup(1)
+Requires=cdr-cleanup.service
 
 [Timer]
-OnCalendar=daily
+# Run daily at 2:30 AM
+OnCalendar=*-*-* 02:30:00
 Persistent=true
-RandomizedDelaySec=3600
+RandomizedDelaySec=300
+
+# Accuracy settings
+AccuracySec=1min
 
 [Install]
 WantedBy=timers.target
 EOF
     
+    chmod 644 "$SYSTEMD_SERVICE" "$SYSTEMD_TIMER"
+    
     # Reload systemd
-    systemctl daemon-reload 2>/dev/null || true
+    systemctl daemon-reload
     
-    print_success "Systemd service files created"
-    print_info "To enable: systemctl enable --now cdr-cleanup.timer"
+    print_success "Systemd service: $SYSTEMD_SERVICE"
+    print_success "Systemd timer: $SYSTEMD_TIMER"
 }
 
-create_cron_job() {
-    print_info "Creating cron job (alternative to systemd)..."
+create_man_page() {
+    print_step "Creating comprehensive man page..."
     
-    # Create cron file
-    cat > /etc/cron.d/cdr-cleanup << 'EOF'
-# CDR Cleanup Cron Job
-SHELL=/bin/bash
-PATH=/sbin:/bin:/usr/sbin:/usr/bin
-MAILTO=root
+    # Create temporary man page file
+    TEMP_MAN="/tmp/${MAIN_SCRIPT_NAME}.1"
+    
+    cat > "$TEMP_MAN" << 'MANPAGE_CONTENT'
+.TH CDR\-CLEANUP 1 "2026-01-01" "Version 4.0" "System Administration Utilities"
+.SH NAME
+cdr\-cleanup \- Cleanup utility for old files based on disk usage threshold or file age
+.SH SYNOPSIS
+.B cdr\-cleanup
+[\fIOPTIONS\fR]...
+.SH DESCRIPTION
+.B cdr\-cleanup
+is a comprehensive bash utility for automatically cleaning up old files from specified directories. It operates in two mutually exclusive modes:
+.PP
+1. \fBDisk Threshold Mode\fR: Deletes the oldest files until disk usage falls below a specified percentage threshold.
+.PP
+2. \fBAge\-Based Mode\fR: Deletes all files older than a specified number of days or months.
+.PP
+The utility includes extensive safety features, logging, and configuration options making it suitable for production environments on RHEL 9 systems.
+.SH MODES OF OPERATION (MUTUALLY EXCLUSIVE)
+.TP
+\fB\-\-threshold=\fIN\fR
+Set disk usage threshold percentage (1\-100). Activates Disk Threshold Mode.
+.br
+\fBExample:\fR \-\-threshold=85 (clean until disk usage < 85%)
+.TP
+\fB\-\-age\-days=\fIN\fR
+Delete files older than N days. Activates Age\-Based Mode.
+.br
+\fBExample:\fR \-\-age\-days=180 (delete files > 180 days old)
+.TP
+\fB\-\-age\-months=\fIN\fR
+Delete files older than N months. Activates Age\-Based Mode.
+.br
+\fBExample:\fR \-\-age\-months=6 (delete files > 6 months old)
+.PP
+\fB⚠ WARNING:\fR These modes cannot be used together. Choose only one.
+.SH EXECUTION OPTIONS
+.TP
+\fB\-\-dry\-run\fR
+Simulation mode only. No files are actually deleted (DEFAULT).
+.br
+Shows what would be deleted without taking action.
+.TP
+\fB\-\-force\fR
+Perform actual deletion. Required for real cleanup operations.
+.SH DIRECTORY AND FILTERING OPTIONS
+.TP
+\fB\-\-directory=\fIPATH\fR
+Target directory to clean. Default: \fI/home/cdrsbx\fR.
+.TP
+\fB\-\-exclude=\fIPATTERN\fR
+Add exclusion pattern for files/directories.
+.br
+Can be used multiple times.
+.br
+\fBExample:\fR \-\-exclude="*.log" \-\-exclude="temp_*"
+.TP
+\fB\-\-include\-hidden\fR
+Include hidden files and directories (those starting with dot).
+.br
+Default: Hidden files are excluded.
+.SH SAFETY LIMIT OPTIONS
+.TP
+\fB\-\-max\-delete=\fIN\fR
+Maximum number of files to delete in one execution (1\-10000).
+.br
+Default: 100. Prevents excessive deletion.
+.TP
+\fB\-\-min\-files=\fIN\fR
+Minimum number of files to keep in each directory (0\-100000).
+.br
+Default: 30. Maintains directory structure integrity.
+.SH BACKUP OPTIONS
+.TP
+\fB\-\-backup\fR
+Enable backup before deletion. Files are copied to BACKUP_DIR.
+.TP
+\fB\-\-no\-backup\fR
+Disable backup (DEFAULT).
+.SH LOGGING AND DEBUG OPTIONS
+.TP
+\fB\-\-debug\fR
+Enable debug mode for detailed output.
+.TP
+\fB\-\-quiet\fR
+Suppress terminal output. Logs only to file.
+.TP
+\fB\-\-no\-log\-rotate\fR
+Disable automatic log rotation.
+.SH CONFIGURATION OPTIONS
+.TP
+\fB\-\-config=\fIFILE\fR
+Use alternative configuration file.
+.br
+Default: \fI/etc/cdr\-cleanup.conf\fR
+.TP
+\fB\-h, \-\-help\fR
+Display help message and exit.
+.SH CONFIGURATION FILE
+The utility reads default configuration from \fI/etc/cdr\-cleanup.conf\fR if it exists. The file uses simple shell variable assignment syntax:
+.PP
+.nf
+# Example configuration
+DIRECTORY="/home/cdrsbx"
+THRESHOLD=85
+MAX_DELETE_PER_RUN=100
+MIN_FILE_COUNT=30
+BACKUP_ENABLED=0
+BACKUP_DIR="/home/backup/deleted_files"
+AUTO_ROTATE_LOG=1
+MAX_LOG_SIZE_MB=50
+DEBUG_MODE=0
+FILE_AGE_DAYS=180
+.fi
+.PP
+\fBPriority Order:\fR
+.IP 1. 4
+Command line arguments
+.IP 2. 4
+Configuration file values
+.IP 3. 4
+Built\-in defaults
+.SH ENVIRONMENT
+.TP
+.B INVOCATION_ID
+If set (typically by systemd), logs are also written to systemd journal.
+.SH FILES
+.TP
+.B /usr/local/bin/cdr\-cleanup
+Main executable script.
+.TP
+.B /etc/cdr\-cleanup.conf
+Main configuration file.
+.TP
+.B /etc/cdr\-cleanup.conf.example
+Example configuration file.
+.TP
+.B /var/log/cdr\-cleanup/cdr\-cleanup.log
+Main log file with timestamped entries.
+.TP
+.B /var/lock/cdr\-cleanup.lock
+Lock file preventing concurrent execution.
+.TP
+.B /etc/logrotate.d/cdr\-cleanup
+Automatic log rotation configuration.
+.TP
+.B /etc/systemd/system/cdr\-cleanup.service
+Systemd service unit file.
+.TP
+.B /etc/systemd/system/cdr\-cleanup.timer
+Systemd timer for scheduled execution.
+.TP
+.B /home/backup/deleted_files
+Default backup directory.
+.TP
+.B /tmp/cdr\-cleanup.*.tmp
+Temporary files created during execution.
+.SH EXAMPLES
+.SS "Basic Disk Threshold Cleanup"
+.nf
+# Clean until disk usage < 80%
+$ cdr\-cleanup \-\-force \-\-threshold=80
+.fi
+.SS "Age\-Based Cleanup with Safety Limits"
+.nf
+# Delete files > 90 days old, max 200 files
+$ cdr\-cleanup \-\-force \-\-age\-days=90 \e
+    \-\-max\-delete=200 \-\-min\-files=10
+.fi
+.SS "Dry Run for Testing"
+.nf
+# Test what would be deleted
+$ cdr\-cleanup \-\-threshold=85 \-\-dry\-run \-\-debug
+.fi
+.SS "Custom Directory with Exclusions"
+.nf
+# Clean custom directory, exclude logs and temp files
+$ cdr\-cleanup \-\-force \-\-threshold=75 \e
+    \-\-directory="/data/cdrs" \e
+    \-\-exclude="*.log" \-\-exclude="*.tmp"
+.fi
+.SS "Comprehensive Example"
+.nf
+$ cdr\-cleanup \-\-force \-\-threshold=80 \e
+    \-\-max\-delete=500 \-\-min\-files=20 \e
+    \-\-backup \-\-debug \-\-exclude="*.log"
+.fi
+.SS "Invalid Usage (Will Error)"
+.nf
+$ cdr\-cleanup \-\-threshold=85 \-\-age\-days=180
+ERROR: Modes cannot be used together
+.fi
+.SH EXIT STATUS
+.TP
+.B 0
+Success
+.TP
+.B 1
+General error (invalid arguments, permission issues, etc.)
+.TP
+.B 130
+Script interrupted by user (SIGINT)
+.SH SAFETY FEATURES
+.IP \(bu 3
+\fBIterative disk checking\fR for threshold mode
+.IP \(bu 3
+\fBFile age caching\fR for improved performance
+.IP \(bu 3
+\fBSafety limits\fR (max delete per run, min files per directory)
+.IP \(bu 3
+\fBAutomatic log rotation\fR (50MB maximum size)
+.IP \(bu 3
+\fBLock file mechanism\fR prevents multiple concurrent executions
+.IP \(bu 3
+\fBDry\-run mode default\fR for safe testing
+.IP \(bu 3
+\fBExclude patterns\fR for system files and directories
+.IP \(bu 3
+\fBBackup option\fR before file deletion
+.IP \(bu 3
+\fBConfiguration file support\fR for persistent settings
+.SH LOGGING FORMAT
+Log entries follow this format:
+.PP
+.nf
+[YYYY\-MM\-DD HH:MM:SS.MMM] [LEVEL] Message
+.fi
+.PP
+Available log levels: SUCCESS, ERROR, WARNING, INFO, DRY_RUN, DEBUG, HEADER
+.SH SCHEDULING
+.SS "Using Systemd Timer (Recommended)"
+.nf
+# Enable and start the timer
+$ sudo systemctl enable cdr\-cleanup.timer
+$ sudo systemctl start cdr\-cleanup.timer
 
-# Run daily at 2 AM
-0 2 * * * root /usr/local/bin/cdr-cleanup --force --quiet
+# Check timer status
+$ systemctl list\-timers cdr\-cleanup.timer
 
-# Force logrotate monthly
-0 0 1 * * root /usr/sbin/logrotate -f /etc/logrotate.d/cdr-cleanup
-EOF
+# View service logs
+$ journalctl \-u cdr\-cleanup.service
+.fi
+.SS "Using Cron"
+.nf
+# Add to crontab (runs daily at 2:30 AM)
+30 2 * * * /usr/local/bin/cdr\-cleanup \e
+    \-\-force \-\-threshold=85 \-\-quiet
+.fi
+.SS "Different Schedule Examples"
+.nf
+# Weekly cleanup (Sunday at 3 AM)
+0 3 * * 0 /usr/local/bin/cdr\-cleanup \e
+    \-\-force \-\-age\-days=90 \-\-quiet
+
+# Monthly cleanup (1st of month at 4 AM)
+0 4 1 * * /usr/local/bin/cdr\-cleanup \e
+    \-\-force \-\-threshold=80 \-\-backup \-\-quiet
+.fi
+.SH TROUBLESHOOTING
+.TP
+.B "Permission denied"
+Ensure the user has appropriate permissions on the target directory and log directory.
+.TP
+.B "Lock file exists"
+Remove \fI/var/lock/cdr\-cleanup.lock\fR if previous execution was interrupted.
+.TP
+.B "Configuration file errors"
+Check syntax of \fI/etc/cdr\-cleanup.conf\fR. Use bash \-n to validate.
+.TP
+.B "Script not found"
+Verify installation: \fBls \-la /usr/local/bin/cdr\-cleanup\fR
+.TP
+.B "Debug information"
+Use \fB\-\-debug\fR flag for detailed execution information.
+.TP
+.B "Check logs"
+Examine \fI/var/log/cdr\-cleanup/cdr\-cleanup.log\fR for error messages.
+.SH PERFORMANCE TIPS
+.IP \(bu 3
+Use \fB\-\-max\-delete\fR to limit impact on busy systems
+.IP \(bu 3
+Schedule during off\-peak hours
+.IP \(bu 3
+Use \fB\-\-dry\-run\fR first to estimate impact
+.IP \(bu 3
+Consider backup requirements with \fB\-\-backup\fR
+.IP \(bu 3
+Adjust \fBMIN_FILE_COUNT\fR based on directory structure
+.SH COMPATIBILITY
+Designed for RHEL 9 and compatible systems. Requires standard GNU utilities.
+.SH AUTHOR
+CDR Management Team
+.SH BUGS
+Report bugs through appropriate support channels. Include log files and configuration details.
+.SH SEE ALSO
+.BR find (1),
+.BR rm (1),
+.BR df (1),
+.BR stat (1),
+.BR logrotate (8),
+.BR systemctl (1),
+.BR crontab (5),
+.BR bash (1)
+MANPAGE_CONTENT
     
-    chmod 644 /etc/cron.d/cdr-cleanup
+    # Compress and install man page
+    mkdir -p "$(dirname "$MAN_PAGE")"
+    gzip -c "$TEMP_MAN" > "$MAN_PAGE"
+    chmod 644 "$MAN_PAGE"
     
-    if [[ -f /etc/cron.d/cdr-cleanup ]]; then
-        print_success "Cron job installed: /etc/cron.d/cdr-cleanup"
-    else
-        print_warning "Failed to install cron job (manual setup required)"
+    # Update man database
+    if command -v mandb &>/dev/null; then
+        mandb >/dev/null 2>&1
+        print_success "Man database updated"
     fi
+    
+    print_success "Man page installed: $MAN_PAGE"
 }
 
-create_test_script() {
-    print_info "Creating test script..."
+create_backup_dir() {
+    print_info "Membuat backup directory..."
     
-    cat > /usr/local/bin/test-cdr-cleanup << 'EOF'
-#!/bin/bash
-# Test script for CDR Cleanup Utility
-
-echo "=== Testing CDR Cleanup Utility ==="
-echo
-
-echo "1. Testing help command:"
-cdr-cleanup --help | head -20
-echo
-
-echo "2. Testing man page:"
-if man cdr-cleanup >/dev/null 2>&1; then
-    echo "Man page exists and is accessible"
-else
-    echo "Man page not accessible"
-fi
-echo
-
-echo "3. Testing dry-run mode:"
-cdr-cleanup --dry-run --threshold=90 2>&1 | tail -10
-echo
-
-echo "4. Testing debug mode:"
-cdr-cleanup --dry-run --debug --threshold=90 2>&1 | grep -E "(Debug|INFO|SUCCESS)" | head -5
-echo
-
-echo "5. Testing config file:"
-if [[ -f /etc/cdr-cleanup.conf ]]; then
-    echo "Config file exists: /etc/cdr-cleanup.conf"
-    echo "Content preview:"
-    head -10 /etc/cdr-cleanup.conf
-else
-    echo "Config file not found"
-fi
-echo
-
-echo "6. Testing log file:"
-if [[ -f /var/log/cdr-cleanup/cdr-cleanup.log ]]; then
-    echo "Log file exists: /var/log/cdr-cleanup/cdr-cleanup.log"
-    echo "Last 5 lines:"
-    tail -5 /var/log/cdr-cleanup/cdr-cleanup.log
-else
-    echo "Log file not found"
-fi
-echo
-
-echo "=== Test Completed ==="
-EOF
+    mkdir -p "$BACKUP_DIR"
+    chmod 700 "$BACKUP_DIR"
     
-    chmod 755 /usr/local/bin/test-cdr-cleanup
-    print_success "Test script created: /usr/local/bin/test-cdr-cleanup"
+    print_success "Backup directory: $BACKUP_DIR"
+}
+
+create_readme() {
+    print_info "Membuat dokumentasi..."
+    
+    README_DIR="/usr/local/share/doc/cdr-cleanup"
+    mkdir -p "$README_DIR"
+    
+    cat > "${README_DIR}/README" << 'README'
+CDR CLEANUP UTILITY
+===================
+
+Quick Start:
+- Test: cdr-cleanup --help
+- Dry run: cdr-cleanup --threshold=85 --dry-run
+- Actual: cdr-cleanup --force --threshold=80
+
+Files:
+- Config: /etc/cdr-cleanup.conf
+- Logs: /var/log/cdr-cleanup/
+- Man page: man cdr-cleanup
+
+Scheduling:
+systemctl enable cdr-cleanup.timer
+systemctl start cdr-cleanup.timer
+README
+    
+    print_success "README: ${README_DIR}/README"
 }
 
 verify_installation() {
-    print_info "Verifying installation..."
+    print_info "Memverifikasi instalasi..."
     
-    local success=true
+    local checks=0
+    local passed=0
     
-    # Check main script
-    if [[ ! -x /usr/local/bin/cdr-cleanup ]]; then
-        print_error "Main script not found or not executable"
-        success=false
-    fi
+    check_file() {
+        ((checks++))
+        if [[ -e "$1" ]]; then
+            print_success "$2"
+            ((passed++))
+        else
+            print_error "$2 tidak ditemukan"
+        fi
+    }
     
-    # Check config file
-    if [[ ! -f /etc/cdr-cleanup.conf ]]; then
-        print_error "Config file not found"
-        success=false
-    fi
+    check_file "$INSTALL_PATH" "Main script"
+    check_file "$CONFIG_FILE" "Config file"
+    check_file "$LOG_DIR" "Log directory"
+    check_file "$LOGROTATE_FILE" "Logrotate config"
+    check_file "$SERVICE_FILE" "Systemd service"
+    check_file "$TIMER_FILE" "Systemd timer"
+    check_file "${MAN_PATH}.gz" "Man page"
     
-    # Check man page
-    if [[ ! -f /usr/local/share/man/man1/cdr-cleanup.1.gz ]]; then
-        print_error "Man page not found"
-        success=false
-    fi
-    
-    # Check logrotate config
-    if [[ ! -f /etc/logrotate.d/cdr-cleanup ]]; then
-        print_error "Logrotate config not found"
-        success=false
-    fi
-    
-    # Check directories
-    if [[ ! -d /var/log/cdr-cleanup ]]; then
-        print_error "Log directory not found"
-        success=false
-    fi
-    
-    # Test script execution
-    if /usr/local/bin/cdr-cleanup --dry-run --threshold=90 >/dev/null 2>&1; then
-        print_success "Script test execution successful"
-    else
-        print_error "Script test execution failed"
-        success=false
-    fi
-    
-    # Test man page access
-    if man cdr-cleanup >/dev/null 2>&1; then
-        print_success "Man page accessible"
-    else
-        print_warning "Man page not accessible (may need manual mandb update)"
-    fi
-    
-    if [[ "$success" == true ]]; then
-        print_success "Installation verification passed!"
+    echo ""
+    if [[ $passed -eq $checks ]]; then
+        print_success "Semua komponen terinstal dengan sukses!"
         return 0
     else
-        print_error "Installation verification failed!"
+        print_warning "$passed dari $checks komponen terinstal"
         return 1
     fi
 }
 
 show_summary() {
-    echo
-    echo "========================================="
-    echo "CDR CLEANUP UTILITY INSTALLATION COMPLETE"
-    echo "========================================="
-    echo
-    echo "Files installed:"
-    echo "  • /usr/local/bin/cdr-cleanup          (Main script)"
-    echo "  • /etc/cdr-cleanup.conf              (Configuration)"
-    echo "  • /usr/local/share/man/man1/cdr-cleanup.1.gz (Man page)"
-    echo "  • /etc/logrotate.d/cdr-cleanup       (Log rotation)"
-    echo "  • /etc/systemd/system/cdr-cleanup.service (Systemd service)"
-    echo "  • /etc/systemd/system/cdr-cleanup.timer   (Systemd timer)"
-    echo "  • /etc/cron.d/cdr-cleanup            (Cron job)"
-    echo "  • /usr/local/bin/test-cdr-cleanup    (Test script)"
-    echo
-    echo "Directories created:"
-    echo "  • /var/log/cdr-cleanup/              (Log files)"
-    echo "  • /home/cdrsbx/                      (Default target)"
-    echo "  • /home/backup/deleted_files/        (Backup directory)"
-    echo "  • /usr/local/share/man/man1/         (Man page directory)"
-    echo
-    echo "Documentation:"
-    echo "  • Man page: man cdr-cleanup"
-    echo "  • Help: cdr-cleanup --help"
-    echo "  • Test: test-cdr-cleanup"
-    echo
-    echo "Log Rotation:"
-    echo "  • Monthly rotation OR when log reaches 50MB"
-    echo "  • Keep 12 months of history"
-    echo "  • Auto rotation in script when size limit reached"
-    echo
-    echo "Quick Start:"
-    echo "  1. Read man page: man cdr-cleanup"
-    echo "  2. Edit configuration: sudo vi /etc/cdr-cleanup.conf"
-    echo "  3. Test script: sudo cdr-cleanup --dry-run --debug"
-    echo "  4. Run manually: sudo cdr-cleanup --force --threshold=85"
-    echo "  5. Enable auto-schedule:"
-    echo "     Systemd: sudo systemctl enable --now cdr-cleanup.timer"
-    echo "     OR Cron: Already configured in /etc/cron.d/cdr-cleanup"
-    echo
-    echo "For help: cdr-cleanup --help OR man cdr-cleanup"
-    echo "========================================="
+    print_header "INSTALASI SELESAI"
+    
+    echo -e "${WHITE}Komponen yang diinstal:${NC}"
+    echo "  • Script:      $INSTALL_PATH"
+    echo "  • Config:      $CONFIG_FILE"
+    echo "  • Logs:        $LOG_DIR"
+    echo "  • Logrotate:   $LOGROTATE_FILE"
+    echo "  • Systemd:     $SERVICE_FILE"
+    echo "  • Timer:       $TIMER_FILE"
+    echo "  • Man page:    man cdr-cleanup"
+    echo "  • Backup dir:  $BACKUP_DIR"
+    echo ""
+    
+    echo -e "${CYAN}Penggunaan:${NC}"
+    echo "  cdr-cleanup --help"
+    echo "  cdr-cleanup --threshold=85 --dry-run"
+    echo "  cdr-cleanup --force --threshold=80"
+    echo ""
+    
+    echo -e "${YELLOW}Untuk auto-cleanup harian:${NC}"
+    echo "  systemctl enable cdr-cleanup.timer"
+    echo "  systemctl start cdr-cleanup.timer"
+    echo ""
+    
+    echo -e "${GREEN}✅ Instalasi berhasil!${NC}"
 }
 
-main() {
-    echo
-    echo "========================================="
-    echo "CDR CLEANUP UTILITY INSTALLATION"
-    echo "========================================="
-    echo
+uninstall() {
+    print_header "UNINSTALL CDR CLEANUP"
     
-    # Check prerequisites
+    read -p "Yakin ingin uninstall? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        print_info "Dibatalkan"
+        exit 0
+    fi
+    
+    print_info "Menghapus komponen..."
+    
+    # Remove files
+    rm -f "$INSTALL_PATH"
+    rm -f "$CONFIG_FILE"
+    rm -f "$LOGROTATE_FILE"
+    rm -f "$SERVICE_FILE"
+    rm -f "$TIMER_FILE"
+    rm -f "${MAN_PATH}.gz"
+    
+    # Keep logs and backup for safety
+    print_info "Logs disimpan di: $LOG_DIR"
+    print_info "Backup directory disimpan: $BACKUP_DIR"
+    
+    # Reload systemd if service files existed
+    if [[ -f "$SERVICE_FILE.bak" ]] || [[ -f "$TIMER_FILE.bak" ]]; then
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    
+    print_success "Uninstall selesai"
+}
+
+# ============================================
+# MAIN INSTALLATION
+# ============================================
+install_all() {
+    print_header "CDR CLEANUP COMPLETE INSTALLER"
+    
+    # Checks
     check_root
-    check_rhel9
-    check_dependencies
+    check_main_script
     
     # Installation steps
-    create_directories
     install_main_script
-    install_config_file
-    install_man_page
-    install_logrotate_config
-    install_systemd_service
-    create_cron_job
-    create_test_script
+    create_config_file
+    setup_logging
+    create_logrotate_config
+    create_systemd_service
+    create_man_page
+    create_backup_dir
+    create_readme
     
-    # Verify installation
-    if verify_installation; then
-        show_summary
-        print_success "Installation completed successfully!"
-        exit 0
-    else
-        print_error "Installation completed with errors. Please check above messages."
-        exit 1
-    fi
+    # Verify
+    verify_installation
+    
+    # Summary
+    show_summary
 }
 
-# Run main function
+# ============================================
+# MAIN SCRIPT
+# ============================================
+main() {
+    case "${1:-}" in
+        "--install"|"-i")
+            install_all
+            ;;
+        "--uninstall"|"-u")
+            uninstall
+            ;;
+        "--help"|"-h")
+            echo "Usage: $0 [OPTION]"
+            echo "Options:"
+            echo "  --install, -i    Install CDR Cleanup"
+            echo "  --uninstall, -u  Uninstall CDR Cleanup"
+            echo "  --help, -h       Show this help"
+            echo ""
+            echo "Example: sudo $0 --install"
+            ;;
+        *)
+            echo "CDR Cleanup Installer"
+            echo "Usage: sudo $0 --install"
+            echo "       sudo $0 --uninstall"
+            ;;
+    esac
+}
+
+# Run main
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     main "$@"
 fi
