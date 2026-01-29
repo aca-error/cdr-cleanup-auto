@@ -11,6 +11,8 @@ Files:
 - Logs: /var/log/cdr-cleanup/
 - Man page: man cdr-cleanup
 
-Scheduling:  
-- systemctl enable cdr-cleanup.timer
-- systemctl start cdr-cleanup.timer
+Scheduling:
+```
+systemctl enable cdr-cleanup.timer
+systemctl start cdr-cleanup.timer
+```
