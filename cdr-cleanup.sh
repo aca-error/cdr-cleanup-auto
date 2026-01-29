@@ -183,10 +183,13 @@ print_to_terminal() {
     local timestamp_full=$(get_timestamp_ms)
     local timestamp_short=$(get_time_only_ms)
     
+    # Always write to log file
     echo "[$timestamp_full] [$level] $message" >> "$LOG_FILE"
     
+    # Terminal output
     if [[ -t 1 ]]; then
-        if [[ "$level" == "DEBUG" ]] && [[ "$DEBUG_MODE" -eq 0 ]]; then
+        # Skip DEBUG messages if DEBUG_MODE is 0
+        if [[ "$level" == "DEBUG" ]] && [[ "${DEBUG_MODE:-0}" -eq 0 ]]; then
             return
         fi
         
@@ -200,8 +203,15 @@ print_to_terminal() {
             "HEADER")  echo -e "\033[1;34m$message\033[0m" ;;
             *)         echo -e "[$timestamp_short] [$level] $message" ;;
         esac
+    else
+        # Non-terminal output
+        if [[ "$level" == "DEBUG" ]] && [[ "${DEBUG_MODE:-0}" -eq 0 ]]; then
+            return
+        fi
+        echo "[$timestamp_short] [$level] $message"
     fi
     
+    # Systemd journal
     if command -v logger >/dev/null 2>&1 && [[ -v INVOCATION_ID ]]; then
         local journal_priority
         case "$level" in
@@ -222,7 +232,9 @@ parse_arguments() {
     USER_EXCLUDE_PATTERNS=()
     INCLUDE_HIDDEN=0
     
-    # Parse arguments pertama
+    # Reset DEBUG_MODE to 0 first
+    DEBUG_MODE=0
+    
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --dry-run) DRY_RUN=1; shift ;;
@@ -233,26 +245,41 @@ parse_arguments() {
             --threshold=*) 
                 THRESHOLD="${1#*=}"; ARG_THRESHOLD_SET=1
                 validate_integer "$THRESHOLD" "--threshold" 1 100
+                if [[ "$DEBUG_MODE" -eq 1 ]]; then
+                    print_to_terminal "DEBUG: Set THRESHOLD to $THRESHOLD" "DEBUG"
+                fi
                 shift ;;
                 
             --max-delete=*) 
                 MAX_DELETE_PER_RUN="${1#*=}"; ARG_MAX_DELETE_SET=1
                 validate_integer "$MAX_DELETE_PER_RUN" "--max-delete" 1 10000
+                if [[ "$DEBUG_MODE" -eq 1 ]]; then
+                    print_to_terminal "DEBUG: Set MAX_DELETE_PER_RUN to $MAX_DELETE_PER_RUN" "DEBUG"
+                fi
                 shift ;;
                 
             --min-files=*) 
                 MIN_FILE_COUNT="${1#*=}"; ARG_MIN_FILES_SET=1
                 validate_integer "$MIN_FILE_COUNT" "--min-files" 0 100000
+                if [[ "$DEBUG_MODE" -eq 1 ]]; then
+                    print_to_terminal "DEBUG: Set MIN_FILE_COUNT to $MIN_FILE_COUNT" "DEBUG"
+                fi
                 shift ;;
                 
             --directory=*) 
                 DIRECTORY="${1#*=}"; ARG_DIRECTORY_SET=1
+                if [[ "$DEBUG_MODE" -eq 1 ]]; then
+                    print_to_terminal "DEBUG: Set DIRECTORY to $DIRECTORY" "DEBUG"
+                fi
                 shift ;;
                 
             --age-days=*) 
                 FILE_AGE_DAYS="${1#*=}"; ARG_AGE_DAYS_SET=1
                 validate_integer "$FILE_AGE_DAYS" "--age-days" 1 36500
                 ENABLE_AGE_BASED_CLEANUP=1
+                if [[ "$DEBUG_MODE" -eq 1 ]]; then
+                    print_to_terminal "DEBUG: Set FILE_AGE_DAYS to $FILE_AGE_DAYS" "DEBUG"
+                fi
                 shift ;;
                 
             --age-months=*) 
@@ -260,26 +287,42 @@ parse_arguments() {
                 validate_integer "$months" "--age-months" 1 1200
                 FILE_AGE_DAYS=$(months_to_days "$months")
                 ENABLE_AGE_BASED_CLEANUP=1
+                if [[ "$DEBUG_MODE" -eq 1 ]]; then
+                    print_to_terminal "DEBUG: Set FILE_AGE_DAYS to $FILE_AGE_DAYS (from $months months)" "DEBUG"
+                fi
                 shift ;;
                 
             --exclude=*)
                 USER_EXCLUDE_PATTERNS+=("${1#*=}")
+                if [[ "$DEBUG_MODE" -eq 1 ]]; then
+                    print_to_terminal "DEBUG: Added exclude pattern: ${1#*=}" "DEBUG"
+                fi
                 shift ;;
                 
             --include-hidden)
                 INCLUDE_HIDDEN=1
+                if [[ "$DEBUG_MODE" -eq 1 ]]; then
+                    print_to_terminal "DEBUG: Include hidden files enabled" "DEBUG"
+                fi
                 shift ;;
                 
             --debug)
                 DEBUG_MODE=1
+                print_to_terminal "Debug mode enabled" "DEBUG"
                 shift ;;
                 
             --config=*)
                 CONFIG_FILE="${1#*=}"
+                if [[ "$DEBUG_MODE" -eq 1 ]]; then
+                    print_to_terminal "DEBUG: Using config file: $CONFIG_FILE" "DEBUG"
+                fi
                 shift ;;
                 
             --no-log-rotate)
                 AUTO_ROTATE_LOG=0; ARG_LOG_ROTATE_SET=1
+                if [[ "$DEBUG_MODE" -eq 1 ]]; then
+                    print_to_terminal "DEBUG: Log rotation disabled" "DEBUG"
+                fi
                 shift ;;
                 
             --quiet) 
@@ -288,6 +331,11 @@ parse_arguments() {
                     local level="${2:-INFO}"
                     local timestamp_full=$(get_timestamp_ms)
                     echo "[$timestamp_full] [$level] $message" >> "$LOG_FILE"
+                    
+                    # Only show DEBUG messages if debug mode is on
+                    if [[ "$level" == "DEBUG" ]] && [[ "${DEBUG_MODE:-0}" -eq 1 ]]; then
+                        echo "[$(get_time_only_ms)] [DEBUG] $message"
+                    fi
                 }
                 shift ;;
                 
@@ -305,11 +353,26 @@ parse_arguments() {
     # Validasi mutual exclusivity setelah semua argument diparsing
     validate_mutual_exclusive
     
+    # Debug: Show final configuration
+    if [[ "$DEBUG_MODE" -eq 1 ]]; then
+        print_to_terminal "DEBUG: Final configuration after parsing:" "DEBUG"
+        print_to_terminal "DEBUG:   MODE: $MODE" "DEBUG"
+        print_to_terminal "DEBUG:   DIRECTORY: $DIRECTORY" "DEBUG"
+        print_to_terminal "DEBUG:   THRESHOLD: $THRESHOLD" "DEBUG"
+        print_to_terminal "DEBUG:   FILE_AGE_DAYS: $FILE_AGE_DAYS" "DEBUG"
+        print_to_terminal "DEBUG:   MAX_DELETE_PER_RUN: $MAX_DELETE_PER_RUN" "DEBUG"
+        print_to_terminal "DEBUG:   MIN_FILE_COUNT: $MIN_FILE_COUNT" "DEBUG"
+        print_to_terminal "DEBUG:   BACKUP_ENABLED: $BACKUP_ENABLED" "DEBUG"
+        print_to_terminal "DEBUG:   DRY_RUN: $DRY_RUN" "DEBUG"
+        print_to_terminal "DEBUG:   DEBUG_MODE: $DEBUG_MODE" "DEBUG"
+        print_to_terminal "DEBUG:   ENABLE_AGE_BASED_CLEANUP: $ENABLE_AGE_BASED_CLEANUP" "DEBUG"
+    fi
+    
     return 0
 }
 
 # =======================
-# LOAD CONFIGURATION FILE - DIPERBAIKI LAGI
+# LOAD CONFIGURATION FILE
 # =======================
 load_config_file() {
     local config_file="$1"
@@ -321,103 +384,68 @@ load_config_file() {
     
     print_to_terminal "Loading configuration from $config_file" "INFO"
     
-    # Gunakan approach yang lebih aman untuk membaca config
-    while IFS='=' read -r key value || [[ -n "$key" ]]; do
-        # Skip comments and empty lines
-        [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
-        
-        # Trim whitespace dan quotes dari key
-        key=$(echo "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
-        
-        # Trim whitespace dan quotes dari value
-        value=$(echo "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
-        
-        # Skip jika key kosong
-        [[ -z "$key" ]] && continue
-        
-        # Debug logging jika perlu
-        if [[ "$DEBUG_MODE" -eq 1 ]]; then
-            print_to_terminal "Config: $key='$value'" "DEBUG"
-        fi
-        
-        # Hanya load nilai jika belum di-set via command line
-        case "$key" in
-            DIRECTORY)
-                if [[ "$ARG_DIRECTORY_SET" -eq 0 ]] && [[ -n "$value" ]]; then
-                    DIRECTORY="$value"
-                fi
-                ;;
-            THRESHOLD)
-                if [[ "$ARG_THRESHOLD_SET" -eq 0 ]] && [[ -n "$value" ]]; then
-                    THRESHOLD="$value"
-                fi
-                ;;
-            MAX_DELETE_PER_RUN)
-                if [[ "$ARG_MAX_DELETE_SET" -eq 0 ]] && [[ -n "$value" ]]; then
-                    MAX_DELETE_PER_RUN="$value"
-                fi
-                ;;
-            MIN_FILE_COUNT)
-                if [[ "$ARG_MIN_FILES_SET" -eq 0 ]] && [[ -n "$value" ]]; then
-                    MIN_FILE_COUNT="$value"
-                fi
-                ;;
-            BACKUP_ENABLED)
-                if [[ "$ARG_BACKUP_SET" -eq 0 ]] && [[ -n "$value" ]]; then
-                    BACKUP_ENABLED="$value"
-                fi
-                ;;
-            AUTO_ROTATE_LOG)
-                if [[ "$ARG_LOG_ROTATE_SET" -eq 0 ]] && [[ -n "$value" ]]; then
-                    AUTO_ROTATE_LOG="$value"
-                fi
-                ;;
-            FILE_AGE_DAYS)
-                if [[ "$ARG_AGE_DAYS_SET" -eq 0 ]] && [[ "$ARG_AGE_MONTHS_SET" -eq 0 ]] && [[ -n "$value" ]]; then
-                    FILE_AGE_DAYS="$value"
-                fi
-                ;;
-            LOG_FILE)
-                if [[ -n "$value" ]]; then
-                    LOG_FILE="$value"
-                fi
-                ;;
-            BACKUP_DIR)
-                if [[ -n "$value" ]]; then
-                    BACKUP_DIR="$value"
-                fi
-                ;;
-            MAX_LOG_SIZE_MB)
-                if [[ -n "$value" ]]; then
-                    MAX_LOG_SIZE_MB="$value"
-                fi
-                ;;
-            DEBUG_MODE)
-                if [[ -n "$value" ]]; then
-                    DEBUG_MODE="$value"
-                fi
-                ;;
-            # Handle other variables safely
-            *)
-                # Only set if it's a valid variable name
-                if [[ "$key" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] && [[ -n "$value" ]]; then
-                    # Use printf untuk menghindari interpretasi khusus
-                    printf -v "$key" '%s' "$value"
-                fi
-                ;;
-        esac
-    done < "$config_file"
+    # Use source with environment variables protection
+    # Save current values that might be overridden
+    local old_directory="$DIRECTORY"
+    local old_threshold="$THRESHOLD"
+    local old_max_delete="$MAX_DELETE_PER_RUN"
+    local old_min_files="$MIN_FILE_COUNT"
+    local old_backup_enabled="$BACKUP_ENABLED"
+    local old_auto_rotate="$AUTO_ROTATE_LOG"
+    local old_file_age_days="$FILE_AGE_DAYS"
+    local old_debug_mode="$DEBUG_MODE"
     
-    # Update calculated values setelah semua config di-load
+    # Source the config file
+    source "$config_file" 2>/dev/null || true
+    
+    # Restore values if they were set via command line
+    if [[ "$ARG_DIRECTORY_SET" -eq 1 ]]; then
+        DIRECTORY="$old_directory"
+    fi
+    
+    if [[ "$ARG_THRESHOLD_SET" -eq 1 ]]; then
+        THRESHOLD="$old_threshold"
+    fi
+    
+    if [[ "$ARG_MAX_DELETE_SET" -eq 1 ]]; then
+        MAX_DELETE_PER_RUN="$old_max_delete"
+    fi
+    
+    if [[ "$ARG_MIN_FILES_SET" -eq 1 ]]; then
+        MIN_FILE_COUNT="$old_min_files"
+    fi
+    
+    if [[ "$ARG_BACKUP_SET" -eq 1 ]]; then
+        BACKUP_ENABLED="$old_backup_enabled"
+    fi
+    
+    if [[ "$ARG_LOG_ROTATE_SET" -eq 1 ]]; then
+        AUTO_ROTATE_LOG="$old_auto_rotate"
+    fi
+    
+    if [[ "$ARG_AGE_DAYS_SET" -eq 1 ]] || [[ "$ARG_AGE_MONTHS_SET" -eq 1 ]]; then
+        FILE_AGE_DAYS="$old_file_age_days"
+    fi
+    
+    # Debug mode from config file only if not set via command line
+    if [[ "$DEBUG_MODE" -eq 0 ]]; then
+        DEBUG_MODE="$old_debug_mode"
+    fi
+    
+    # Update calculated values
     FILE_AGE_SECONDS=$((FILE_AGE_DAYS * 24 * 60 * 60))
     
-    # Debug output untuk memverifikasi
+    # Debug output
     if [[ "$DEBUG_MODE" -eq 1 ]]; then
-        print_to_terminal "After config load:" "DEBUG"
-        print_to_terminal "  DIRECTORY='$DIRECTORY'" "DEBUG"
-        print_to_terminal "  THRESHOLD='$THRESHOLD'" "DEBUG"
-        print_to_terminal "  MAX_DELETE_PER_RUN='$MAX_DELETE_PER_RUN'" "DEBUG"
-        print_to_terminal "  MIN_FILE_COUNT='$MIN_FILE_COUNT'" "DEBUG"
+        print_to_terminal "DEBUG: After loading config file:" "DEBUG"
+        print_to_terminal "DEBUG:   DIRECTORY='$DIRECTORY'" "DEBUG"
+        print_to_terminal "DEBUG:   THRESHOLD='$THRESHOLD'" "DEBUG"
+        print_to_terminal "DEBUG:   FILE_AGE_DAYS='$FILE_AGE_DAYS'" "DEBUG"
+        print_to_terminal "DEBUG:   MAX_DELETE_PER_RUN='$MAX_DELETE_PER_RUN'" "DEBUG"
+        print_to_terminal "DEBUG:   MIN_FILE_COUNT='$MIN_FILE_COUNT'" "DEBUG"
+        print_to_terminal "DEBUG:   BACKUP_ENABLED='$BACKUP_ENABLED'" "DEBUG"
+        print_to_terminal "DEBUG:   AUTO_ROTATE_LOG='$AUTO_ROTATE_LOG'" "DEBUG"
+        print_to_terminal "DEBUG:   DEBUG_MODE='$DEBUG_MODE'" "DEBUG"
     fi
     
     return 0
@@ -445,11 +473,6 @@ MODE 2: AGE BASED
 
 ❗ PERHATIAN: Mode-mode di atas TIDAK BISA digunakan bersamaan.
     Pilih salah satu: --threshold ATAU --age-days ATAU --age-months
-
-CONFIGURATION:
-    Main config: /etc/cdr-cleanup.conf
-    Log file: /var/log/cdr-cleanup/cdr-cleanup.log
-    Lock file: /var/lock/cdr-cleanup.lock
 
 USAGE:
     ./$script_name [OPTIONS]
@@ -623,6 +646,15 @@ perform_disk_threshold_cleanup() {
     print_to_terminal "Max files to delete: $MAX_DELETE_PER_RUN" "INFO"
     print_to_terminal "Min files per directory: $MIN_FILE_COUNT" "INFO"
     
+    # Debug information
+    if [[ "$DEBUG_MODE" -eq 1 ]]; then
+        print_to_terminal "DEBUG: Mode parameters:" "DEBUG"
+        print_to_terminal "DEBUG:   THRESHOLD=$THRESHOLD%" "DEBUG"
+        print_to_terminal "DEBUG:   MAX_DELETE_PER_RUN=$MAX_DELETE_PER_RUN" "DEBUG"
+        print_to_terminal "DEBUG:   MIN_FILE_COUNT=$MIN_FILE_COUNT" "DEBUG"
+        print_to_terminal "DEBUG:   DIRECTORY=$DIRECTORY" "DEBUG"
+    fi
+    
     local current_usage
     current_usage=$(get_disk_usage "$DIRECTORY")
     local initial_usage="$current_usage"
@@ -676,12 +708,21 @@ perform_disk_threshold_cleanup() {
         
         print_to_terminal "Processing batch of $batch_size files..." "INFO"
         
+        # Debug batch information
+        if [[ "$DEBUG_MODE" -eq 1 ]]; then
+            print_to_terminal "DEBUG: Batch size: $batch_size" "DEBUG"
+            print_to_terminal "DEBUG: Remaining to target: $remaining_to_target%" "DEBUG"
+        fi
+        
         # Get next batch of files to delete
         local batch_deleted
         batch_deleted=$(get_next_batch "$batch_size")
         
         if [[ "$batch_deleted" -eq 0 ]]; then
             print_to_terminal "No more files eligible for deletion (min files per dir constraint)" "INFO"
+            if [[ "$DEBUG_MODE" -eq 1 ]]; then
+                print_to_terminal "DEBUG: MIN_FILE_COUNT constraint reached" "DEBUG"
+            fi
             break
         fi
         
@@ -725,17 +766,39 @@ perform_disk_threshold_cleanup() {
         fi
     fi
     
+    # Debug summary
+    if [[ "$DEBUG_MODE" -eq 1 ]]; then
+        print_to_terminal "DEBUG: Cleanup summary:" "DEBUG"
+        print_to_terminal "DEBUG:   Initial usage: ${initial_usage}%" "DEBUG"
+        print_to_terminal "DEBUG:   Final usage: ${current_usage}%" "DEBUG"
+        print_to_terminal "DEBUG:   Files deleted: ${total_deleted}" "DEBUG"
+        print_to_terminal "DEBUG:   Iterations: $((iteration - 1))" "DEBUG"
+    fi
+    
     return 0
 }
 
 # =======================
-# AGE BASED CLEANUP
+# AGE BASED CLEANUP - DIPERBAIKI DENGAN DEBUG
 # =======================
 perform_age_based_cleanup() {
     print_to_terminal "Starting AGE BASED cleanup..." "INFO"
     print_to_terminal "Target: Files older than ${FILE_AGE_DAYS} days" "INFO"
     print_to_terminal "Max files to delete: $MAX_DELETE_PER_RUN" "INFO"
     print_to_terminal "Min files per directory: $MIN_FILE_COUNT" "INFO"
+    
+    # DEBUG: Show parameters
+    if [[ "$DEBUG_MODE" -eq 1 ]]; then
+        print_to_terminal "DEBUG: Age-based cleanup parameters:" "DEBUG"
+        print_to_terminal "DEBUG:   FILE_AGE_DAYS: $FILE_AGE_DAYS days" "DEBUG"
+        print_to_terminal "DEBUG:   MAX_DELETE_PER_RUN: $MAX_DELETE_PER_RUN" "DEBUG"
+        print_to_terminal "DEBUG:   MIN_FILE_COUNT: $MIN_FILE_COUNT" "DEBUG"
+        print_to_terminal "DEBUG:   Current time: $(date)" "DEBUG"
+        
+        local cutoff_seconds=$(( $(date +%s) - (FILE_AGE_DAYS * 86400) ))
+        print_to_terminal "DEBUG:   Cutoff time: $(date -d "@$cutoff_seconds")" "DEBUG"
+        print_to_terminal "DEBUG:   Cutoff Unix timestamp: $cutoff_seconds" "DEBUG"
+    fi
     
     # Generate file list
     if ! generate_all_files_list; then
@@ -749,6 +812,11 @@ perform_age_based_cleanup() {
     local total_deleted=0
     
     # Count eligible files
+    if [[ "$DEBUG_MODE" -eq 1 ]]; then
+        print_to_terminal "DEBUG: Scanning for eligible files..." "DEBUG"
+        local scanned=0
+    fi
+    
     while IFS='|' read -r timestamp_str filepath; do
         local dirname=$(dirname "$filepath")
         local current_count=${DIR_COUNTS_CACHE["$dirname"]:-0}
@@ -766,24 +834,56 @@ perform_age_based_cleanup() {
         
         if [[ "$file_ts" -lt "$cutoff_time" ]]; then
             total_eligible=$((total_eligible + 1))
+            if [[ "$DEBUG_MODE" -eq 1 ]] && [[ $total_eligible -le 3 ]]; then
+                local file_age=$(((current_time - file_ts) / 86400))
+                print_to_terminal "DEBUG: Eligible file #$total_eligible: $filepath (age: $file_age days)" "DEBUG"
+            fi
+        fi
+        
+        if [[ "$DEBUG_MODE" -eq 1 ]]; then
+            scanned=$((scanned + 1))
+            if [[ $((scanned % 5000)) -eq 0 ]]; then
+                print_to_terminal "DEBUG: Scanned $scanned files, found $total_eligible eligible so far" "DEBUG"
+            fi
         fi
     done < "$TEMP_ALL_FILES"
     
     print_to_terminal "Found $total_eligible files older than $FILE_AGE_DAYS days" "INFO"
     
+    # DEBUG: More information
+    if [[ "$DEBUG_MODE" -eq 1 ]]; then
+        local total_files=$(wc -l < "$TEMP_ALL_FILES" 2>/dev/null || echo 0)
+        print_to_terminal "DEBUG: Total files scanned: $total_files" "DEBUG"
+        if [[ $total_files -gt 0 ]]; then
+            local eligible_percent=$((total_eligible * 100 / total_files))
+            print_to_terminal "DEBUG: Eligible percentage: ${eligible_percent}%" "DEBUG"
+        fi
+    fi
+    
     if [[ "$total_eligible" -eq 0 ]]; then
         print_to_terminal "No files meet the age criteria" "INFO"
+        if [[ "$DEBUG_MODE" -eq 1 ]]; then
+            print_to_terminal "DEBUG: No files older than $FILE_AGE_DAYS days found" "DEBUG"
+        fi
         return 0
     fi
     
     # Select files for deletion
     > "$TEMP_DELETE_LIST"
     
+    if [[ "$DEBUG_MODE" -eq 1 ]]; then
+        print_to_terminal "DEBUG: Selecting up to $MAX_DELETE_PER_RUN files for deletion" "DEBUG"
+        print_to_terminal "DEBUG: MIN_FILE_COUNT constraint: $MIN_FILE_COUNT files per directory" "DEBUG"
+    fi
+    
     while IFS='|' read -r timestamp_str filepath && [[ $total_deleted -lt $MAX_DELETE_PER_RUN ]]; do
         local dirname=$(dirname "$filepath")
         local current_count=${DIR_COUNTS_CACHE["$dirname"]:-0}
         
         if [[ "$current_count" -le "$MIN_FILE_COUNT" ]]; then
+            if [[ "$DEBUG_MODE" -eq 1 ]] && [[ $total_deleted -lt 3 ]]; then
+                print_to_terminal "DEBUG: Skipping $filepath (directory '$dirname' has only $current_count files, min=$MIN_FILE_COUNT)" "DEBUG"
+            fi
             continue
         fi
         
@@ -798,13 +898,36 @@ perform_age_based_cleanup() {
             echo "$filepath" >> "$TEMP_DELETE_LIST"
             DIR_COUNTS_CACHE["$dirname"]=$((current_count - 1))
             total_deleted=$((total_deleted + 1))
+            
+            if [[ "$DEBUG_MODE" -eq 1 ]] && [[ $total_deleted -le 3 ]]; then
+                local file_age_days=$(((current_time - file_ts) / 86400))
+                print_to_terminal "DEBUG: Selected for deletion #$total_deleted: $filepath (age: $file_age_days days)" "DEBUG"
+            fi
         fi
     done < "$TEMP_ALL_FILES"
+    
+    # DEBUG: Show selection results
+    if [[ "$DEBUG_MODE" -eq 1 ]]; then
+        local delete_list_size=$(wc -l < "$TEMP_DELETE_LIST" 2>/dev/null || echo 0)
+        print_to_terminal "DEBUG: Selected $total_deleted files for deletion" "DEBUG"
+        print_to_terminal "DEBUG: Delete list size: $delete_list_size lines" "DEBUG"
+        if [[ $delete_list_size -gt 0 ]]; then
+            print_to_terminal "DEBUG: First 3 files in delete list:" "DEBUG"
+            head -3 "$TEMP_DELETE_LIST" | while read -r file; do
+                local age=$(get_file_age_days "$file")
+                print_to_terminal "DEBUG:   $file (age: $age days)" "DEBUG"
+            done
+        fi
+    fi
     
     # Process deletions
     if [[ -s "$TEMP_DELETE_LIST" ]]; then
         local count=0
         local errors=0
+        
+        if [[ "$DEBUG_MODE" -eq 1 ]]; then
+            print_to_terminal "DEBUG: Processing deletion list..." "DEBUG"
+        fi
         
         while read -r filepath; do
             if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -826,21 +949,48 @@ perform_age_based_cleanup() {
         print_to_terminal "Files deleted: $count" "INFO"
         print_to_terminal "Errors: $errors" "INFO"
         print_to_terminal "Remaining eligible files: $((total_eligible - count))" "INFO"
+        
+        # DEBUG: Summary
+        if [[ "$DEBUG_MODE" -eq 1 ]]; then
+            print_to_terminal "DEBUG: Age-based cleanup summary:" "DEBUG"
+            print_to_terminal "DEBUG:   Total eligible files: $total_eligible" "DEBUG"
+            print_to_terminal "DEBUG:   Successfully deleted: $count" "DEBUG"
+            print_to_terminal "DEBUG:   Deletion errors: $errors" "DEBUG"
+            print_to_terminal "DEBUG:   Remaining eligible: $((total_eligible - count))" "DEBUG"
+            print_to_terminal "DEBUG:   Completion time: $(date)" "DEBUG"
+        fi
     else
         print_to_terminal "No files selected for deletion" "INFO"
+        if [[ "$DEBUG_MODE" -eq 1 ]]; then
+            print_to_terminal "DEBUG: Delete list is empty" "DEBUG"
+            print_to_terminal "DEBUG: Possible reasons:" "DEBUG"
+            print_to_terminal "DEBUG: - No files older than $FILE_AGE_DAYS days" "DEBUG"
+            print_to_terminal "DEBUG: - MIN_FILE_COUNT ($MIN_FILE_COUNT) constraint preventing deletion" "DEBUG"
+            print_to_terminal "DEBUG: - MAX_DELETE_PER_RUN ($MAX_DELETE_PER_RUN) limit reached (unlikely)" "DEBUG"
+            print_to_terminal "DEBUG: - File list might be empty" "DEBUG"
+        fi
     fi
     
     return 0
 }
 
 # =======================
-# SUPPORTING FUNCTIONS
+# SUPPORTING FUNCTIONS DENGAN DEBUG
 # =======================
 generate_all_files_list() {
     print_to_terminal "Generating file list (sorted by age, oldest first)..." "INFO"
     
+    # Debug: Show parameters
+    if [[ "$DEBUG_MODE" -eq 1 ]]; then
+        print_to_terminal "DEBUG: Generating file list from: $DIRECTORY" "DEBUG"
+        print_to_terminal "DEBUG: INCLUDE_HIDDEN: $INCLUDE_HIDDEN" "DEBUG"
+        print_to_terminal "DEBUG: DEFAULT_EXCLUDE_PATTERNS count: ${#DEFAULT_EXCLUDE_PATTERNS[@]}" "DEBUG"
+        print_to_terminal "DEBUG: USER_EXCLUDE_PATTERNS count: ${#USER_EXCLUDE_PATTERNS[@]}" "DEBUG"
+    fi
+    
     local find_args=("$DIRECTORY" "-type" "f")
     
+    # Exclude log files and lock files
     find_args+=("!" "-path" "$LOG_FILE")
     find_args+=("!" "-path" "$LOG_FILE.old")
     find_args+=("!" "-path" "$LOCK_FILE")
@@ -849,37 +999,81 @@ generate_all_files_list() {
         find_args+=("!" "-path" "$BACKUP_DIR/*")
     fi
     
+    # Exclude temp files
     find_args+=("!" "-path" "*/cdr-cleanup.*")
-    
     find_args+=("!" "-name" "*.tmp")
     find_args+=("!" "-name" "temp*")
     find_args+=("!" "-name" "*.temp")
     
+    # Hidden files handling
     if [[ "$INCLUDE_HIDDEN" -eq 0 ]]; then
         find_args+=("!" "-path" "*/.*")
         find_args+=("!" "-name" ".*")
     fi
     
+    # Default exclude patterns
     for pattern in "${DEFAULT_EXCLUDE_PATTERNS[@]}"; do
         find_args+=("!" "-path" "*/${pattern}")
         find_args+=("!" "-name" "${pattern}")
     done
     
+    # User exclude patterns
     for pattern in "${USER_EXCLUDE_PATTERNS[@]}"; do
         find_args+=("!" "-path" "*/${pattern}")
         find_args+=("!" "-name" "${pattern}")
     done
     
+    # Debug: Show find command
+    if [[ "$DEBUG_MODE" -eq 1 ]]; then
+        print_to_terminal "DEBUG: Find command arguments count: ${#find_args[@]}" "DEBUG"
+        if [[ ${#find_args[@]} -lt 20 ]]; then
+            print_to_terminal "DEBUG: Find args: ${find_args[*]}" "DEBUG"
+        fi
+    fi
+    
     if ! LC_ALL=C find "${find_args[@]}" -printf '%T@|%p\n' 2>/dev/null | \
         sort -t'|' -k1,1n > "$TEMP_ALL_FILES"; then
+        print_to_terminal "Failed to generate file list" "ERROR"
+        if [[ "$DEBUG_MODE" -eq 1 ]]; then
+            print_to_terminal "DEBUG: Find command failed" "DEBUG"
+            print_to_terminal "DEBUG: Check directory permissions: $DIRECTORY" "DEBUG"
+        fi
         return 1
     fi
 
     local total_found
     total_found=$(wc -l < "$TEMP_ALL_FILES" 2>/dev/null || echo 0)
     
+    # Debug: Show file count and sample
+    if [[ "$DEBUG_MODE" -eq 1 ]]; then
+        print_to_terminal "DEBUG: Total files found: $total_found" "DEBUG"
+        if [[ $total_found -gt 0 ]]; then
+            # Show first few files for debugging
+            print_to_terminal "DEBUG: First 3 files in list (oldest first):" "DEBUG"
+            head -3 "$TEMP_ALL_FILES" | while IFS='|' read -r ts file; do
+                local age=$(( ($(date +%s) - ${ts%.*}) / 86400 ))
+                local date_str=$(date -d "@${ts%.*}" "+%Y-%m-%d %H:%M:%S")
+                print_to_terminal "DEBUG:   $file" "DEBUG"
+                print_to_terminal "DEBUG:     Timestamp: $ts" "DEBUG"
+                print_to_terminal "DEBUG:     Date: $date_str" "DEBUG"
+                print_to_terminal "DEBUG:     Age: $age days" "DEBUG"
+            done
+            
+            # Show last few files (newest)
+            print_to_terminal "DEBUG: Last 3 files in list (newest first):" "DEBUG"
+            tail -3 "$TEMP_ALL_FILES" | while IFS='|' read -r ts file; do
+                local age=$(( ($(date +%s) - ${ts%.*}) / 86400 ))
+                print_to_terminal "DEBUG:   $file (age: $age days)" "DEBUG"
+            done
+        fi
+    fi
+    
     if [[ "$total_found" -eq 0 ]]; then
         print_to_terminal "No files found (after exclude patterns)" "INFO"
+        if [[ "$DEBUG_MODE" -eq 1 ]]; then
+            print_to_terminal "DEBUG: Check find arguments and directory permissions" "DEBUG"
+            print_to_terminal "DEBUG: Directory exists: $(ls -ld "$DIRECTORY" 2>/dev/null || echo "NO")" "DEBUG"
+        fi
         return 0
     fi
     
@@ -891,6 +1085,24 @@ generate_all_files_list() {
         DIR_COUNTS_CACHE["$dirname"]=$(( ${DIR_COUNTS_CACHE["$dirname"]:-0} + 1 ))
     done < "$TEMP_ALL_FILES"
     
+    # Debug: Show directory counts summary
+    if [[ "$DEBUG_MODE" -eq 1 ]]; then
+        print_to_terminal "DEBUG: Directory count summary (top 5):" "DEBUG"
+        for dir in "${!DIR_COUNTS_CACHE[@]}"; do
+            echo "$dir:${DIR_COUNTS_CACHE[$dir]}"
+        done | sort -t: -k2 -nr | head -5 | while IFS=':' read -r dir count; do
+            print_to_terminal "DEBUG:   $dir: $count files" "DEBUG"
+        done
+        
+        # Show directories with few files (might be affected by MIN_FILE_COUNT)
+        print_to_terminal "DEBUG: Directories with <= $MIN_FILE_COUNT files (MIN_FILE_COUNT constraint):" "DEBUG"
+        for dir in "${!DIR_COUNTS_CACHE[@]}"; do
+            if [[ ${DIR_COUNTS_CACHE[$dir]} -le $MIN_FILE_COUNT ]]; then
+                print_to_terminal "DEBUG:   $dir: ${DIR_COUNTS_CACHE[$dir]} files" "DEBUG"
+            fi
+        done | head -5
+    fi
+    
     return 0
 }
 
@@ -900,17 +1112,35 @@ get_next_batch() {
     
     > "$TEMP_BATCH_LIST"
     
+    if [[ "$DEBUG_MODE" -eq 1 ]]; then
+        print_to_terminal "DEBUG: Getting next batch of $batch_size files" "DEBUG"
+    fi
+    
     while IFS='|' read -r timestamp_str filepath && [[ $processed -lt $batch_size ]]; do
         local dirname=$(dirname "$filepath")
         local current_count=${DIR_COUNTS_CACHE["$dirname"]:-0}
         
         if [[ "$current_count" -le "$MIN_FILE_COUNT" ]]; then
+            if [[ "$DEBUG_MODE" -eq 1 ]] && [[ $processed -eq 0 ]]; then
+                print_to_terminal "DEBUG: Skipping $filepath (directory '$dirname' has only $current_count files)" "DEBUG"
+            fi
             continue
         fi
         
         echo "$filepath" >> "$TEMP_BATCH_LIST"
         DIR_COUNTS_CACHE["$dirname"]=$((current_count - 1))
         processed=$((processed + 1))
+        
+        if [[ "$DEBUG_MODE" -eq 1 ]] && [[ $processed -le 3 ]]; then
+            local file_ts
+            if [[ "$timestamp_str" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+                file_ts=$(printf "%.0f" "$timestamp_str")
+            else
+                file_ts=${timestamp_str%%.*}
+            fi
+            local age=$(( ($(date +%s) - file_ts) / 86400 ))
+            print_to_terminal "DEBUG: Added to batch #$processed: $filepath (age: $age days)" "DEBUG"
+        fi
     done < "$TEMP_ALL_FILES"
     
     # Remove processed lines
@@ -918,11 +1148,21 @@ get_next_batch() {
         sed -i "1,${processed}d" "$TEMP_ALL_FILES"
     fi
     
+    if [[ "$DEBUG_MODE" -eq 1 ]]; then
+        print_to_terminal "DEBUG: Batch selection complete: $processed files selected" "DEBUG"
+    fi
+    
     echo "$processed"
 }
 
 delete_batch() {
     local count=0
+    
+    if [[ "$DEBUG_MODE" -eq 1 ]]; then
+        print_to_terminal "DEBUG: Processing batch deletion" "DEBUG"
+        print_to_terminal "DEBUG: DRY_RUN mode: $DRY_RUN" "DEBUG"
+        print_to_terminal "DEBUG: Batch list size: $(wc -l < "$TEMP_BATCH_LIST")" "DEBUG"
+    fi
     
     while read -r filepath; do
         if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -935,9 +1175,17 @@ delete_batch() {
                 count=$((count + 1))
             else
                 print_to_terminal "Failed to delete: $filepath" "ERROR"
+                if [[ "$DEBUG_MODE" -eq 1 ]]; then
+                    print_to_terminal "DEBUG: Delete failed for: $filepath" "DEBUG"
+                    print_to_terminal "DEBUG: File exists: $(ls -la "$filepath" 2>/dev/null || echo "NO")" "DEBUG"
+                fi
             fi
         fi
     done < "$TEMP_BATCH_LIST"
+    
+    if [[ "$DEBUG_MODE" -eq 1 ]]; then
+        print_to_terminal "DEBUG: Batch deletion complete: $count files processed" "DEBUG"
+    fi
     
     echo "$count"
 }
@@ -946,6 +1194,7 @@ delete_batch() {
 # MAIN SCRIPT
 # =======================
 main() {
+    # Create log directory if it doesn't exist
     mkdir -p "/var/log/cdr-cleanup" 2>/dev/null || {
         echo "Error: Cannot create log directory /var/log/cdr-cleanup"
         exit 1
