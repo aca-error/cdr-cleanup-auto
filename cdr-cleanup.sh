@@ -95,6 +95,17 @@ TEMP_ALL_FILES=$(mktemp /var/tmp/cdr_cleanup_all_XXXXXX)
 TEMP_DELETE_LIST=$(mktemp /var/tmp/cdr_cleanup_delete_XXXXXX)
 
 # =======================
+# FLAG UNTUK TRACKING ARGUMENTS
+# =======================
+# Global flags untuk tracking argument
+ARG_DIRECTORY_SET=0
+ARG_THRESHOLD_SET=0
+ARG_MAX_DELETE_SET=0
+ARG_MIN_FILES_SET=0
+ARG_BACKUP_SET=0
+ARG_LOG_ROTATE_SET=0
+
+# =======================
 # FUNGSI LOAD CONFIG
 # =======================
 load_config() {
@@ -102,52 +113,95 @@ load_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
         print_to_terminal "Loading configuration from $CONFIG_FILE" "INFO"
         
+        # Simpan nilai dari arguments sebelum di-override
+        local ARG_DIRECTORY="$DIRECTORY"
+        local ARG_THRESHOLD="$THRESHOLD"
+        local ARG_MAX_DELETE="$MAX_DELETE_PER_RUN"
+        local ARG_MIN_FILES="$MIN_FILE_COUNT"
+        local ARG_BACKUP_ENABLED="$BACKUP_ENABLED"
+        local ARG_BACKUP_DIR="$BACKUP_DIR"
+        local ARG_AUTO_ROTATE_LOG="$AUTO_ROTATE_LOG"
+        
         # Source config file dengan safety check
         if ! source "$CONFIG_FILE" 2>/dev/null; then
             print_to_terminal "Error: Failed to load config file $CONFIG_FILE" "ERROR"
             exit 1
         fi
         
-        # Validate loaded variables
-        if [[ -z "${DIRECTORY:-}" ]]; then
-            print_to_terminal "Warning: DIRECTORY not set in config, using default" "WARNING"
+        # ========== CRITICAL FIX: OVERRIDE DENGAN PRIORITAS ==========
+        # Command line arguments > Config file > Default values
+        
+        print_to_terminal "Merging command line arguments with config..." "DEBUG"
+        
+        # DIRECTORY - override hanya jika di-set via argument
+        if [[ "$ARG_DIRECTORY_SET" -eq 1 ]]; then
+            DIRECTORY="$ARG_DIRECTORY"
+            print_to_terminal "Using directory from arguments: $DIRECTORY" "DEBUG"
+        elif [[ -z "${DIRECTORY:-}" ]]; then
             DIRECTORY="/home/cdrsbx"
+            print_to_terminal "Using default directory: $DIRECTORY" "DEBUG"
         fi
         
-        if [[ -z "${THRESHOLD:-}" ]] || ! [[ "$THRESHOLD" =~ ^[0-9]+$ ]]; then
-            print_to_terminal "Warning: Invalid THRESHOLD in config, using default 90" "WARNING"
+        # THRESHOLD
+        if [[ "$ARG_THRESHOLD_SET" -eq 1 ]]; then
+            THRESHOLD="$ARG_THRESHOLD"
+            print_to_terminal "Using threshold from arguments: $THRESHOLD" "DEBUG"
+        elif [[ -z "${THRESHOLD:-}" ]] || ! [[ "$THRESHOLD" =~ ^[0-9]+$ ]]; then
             THRESHOLD=90
+            print_to_terminal "Using default threshold: $THRESHOLD" "DEBUG"
         fi
         
-        if [[ -z "${MIN_FILE_COUNT:-}" ]] || ! [[ "$MIN_FILE_COUNT" =~ ^[0-9]+$ ]]; then
-            print_to_terminal "Warning: Invalid MIN_FILE_COUNT in config, using default 30" "WARNING"
+        # MIN_FILE_COUNT
+        if [[ "$ARG_MIN_FILES_SET" -eq 1 ]]; then
+            MIN_FILE_COUNT="$ARG_MIN_FILES"
+            print_to_terminal "Using min-files from arguments: $MIN_FILE_COUNT" "DEBUG"
+        elif [[ -z "${MIN_FILE_COUNT:-}" ]] || ! [[ "$MIN_FILE_COUNT" =~ ^[0-9]+$ ]]; then
             MIN_FILE_COUNT=30
+            print_to_terminal "Using default min-files: $MIN_FILE_COUNT" "DEBUG"
         fi
         
-        if [[ -z "${MAX_DELETE_PER_RUN:-}" ]] || ! [[ "$MAX_DELETE_PER_RUN" =~ ^[0-9]+$ ]]; then
-            print_to_terminal "Warning: Invalid MAX_DELETE_PER_RUN in config, using default 100" "WARNING"
+        # ========== MAX_DELETE_PER_RUN - INI YANG DIPERBAIKI ==========
+        if [[ "$ARG_MAX_DELETE_SET" -eq 1 ]]; then
+            MAX_DELETE_PER_RUN="$ARG_MAX_DELETE"
+            print_to_terminal "Using max-delete from arguments: $MAX_DELETE_PER_RUN" "DEBUG"
+        elif [[ -z "${MAX_DELETE_PER_RUN:-}" ]] || ! [[ "$MAX_DELETE_PER_RUN" =~ ^[0-9]+$ ]]; then
             MAX_DELETE_PER_RUN=100
+            print_to_terminal "Using default max-delete: $MAX_DELETE_PER_RUN" "DEBUG"
         fi
         
-        if [[ -z "${BACKUP_ENABLED:-}" ]] || ! [[ "$BACKUP_ENABLED" =~ ^[0-1]$ ]]; then
-            print_to_terminal "Warning: Invalid BACKUP_ENABLED in config, using default 0" "WARNING"
+        # BACKUP_ENABLED
+        if [[ "$ARG_BACKUP_SET" -eq 1 ]]; then
+            BACKUP_ENABLED="$ARG_BACKUP_ENABLED"
+            print_to_terminal "Using backup from arguments: $BACKUP_ENABLED" "DEBUG"
+        elif [[ -z "${BACKUP_ENABLED:-}" ]] || ! [[ "$BACKUP_ENABLED" =~ ^[0-1]$ ]]; then
             BACKUP_ENABLED=0
+            print_to_terminal "Using default backup: $BACKUP_ENABLED" "DEBUG"
         fi
         
-        if [[ -z "${BACKUP_DIR:-}" ]]; then
-            print_to_terminal "Warning: BACKUP_DIR not set in config, using default" "WARNING"
+        # BACKUP_DIR
+        if [[ "$ARG_BACKUP_SET" -eq 1 ]] && [[ -n "$ARG_BACKUP_DIR" ]]; then
+            BACKUP_DIR="$ARG_BACKUP_DIR"
+            print_to_terminal "Using backup-dir from arguments: $BACKUP_DIR" "DEBUG"
+        elif [[ -z "${BACKUP_DIR:-}" ]]; then
             BACKUP_DIR="/home/backup/deleted_files"
+            print_to_terminal "Using default backup-dir: $BACKUP_DIR" "DEBUG"
         fi
         
-        if [[ -z "${MAX_LOG_SIZE_MB:-}" ]] || ! [[ "$MAX_LOG_SIZE_MB" =~ ^[0-9]+$ ]]; then
-            print_to_terminal "Warning: Invalid MAX_LOG_SIZE_MB in config, using default 50" "WARNING"
-            MAX_LOG_SIZE_MB=50
-        fi
-        
-        if [[ -z "${AUTO_ROTATE_LOG:-}" ]] || ! [[ "$AUTO_ROTATE_LOG" =~ ^[0-1]$ ]]; then
-            print_to_terminal "Warning: Invalid AUTO_ROTATE_LOG in config, using default 1" "WARNING"
+        # AUTO_ROTATE_LOG
+        if [[ "$ARG_LOG_ROTATE_SET" -eq 1 ]]; then
+            AUTO_ROTATE_LOG="$ARG_AUTO_ROTATE_LOG"
+            print_to_terminal "Using log-rotate from arguments: $AUTO_ROTATE_LOG" "DEBUG"
+        elif [[ -z "${AUTO_ROTATE_LOG:-}" ]] || ! [[ "$AUTO_ROTATE_LOG" =~ ^[0-1]$ ]]; then
             AUTO_ROTATE_LOG=1
+            print_to_terminal "Using default log-rotate: $AUTO_ROTATE_LOG" "DEBUG"
         fi
+        
+        # MAX_LOG_SIZE_MB (tidak ada argument khusus, ambil dari config)
+        if [[ -z "${MAX_LOG_SIZE_MB:-}" ]] || ! [[ "$MAX_LOG_SIZE_MB" =~ ^[0-9]+$ ]]; then
+            MAX_LOG_SIZE_MB=50
+            print_to_terminal "Using default max-log-size: $MAX_LOG_SIZE_MB" "DEBUG"
+        fi
+        
     else
         print_to_terminal "Config file $CONFIG_FILE not found, using default values" "INFO"
     fi
@@ -652,12 +706,12 @@ parse_arguments() {
         case "$1" in
             --dry-run) DRY_RUN=1; shift ;;
             --force) DRY_RUN=0; shift ;;
-            --backup) BACKUP_ENABLED=1; shift ;;
-            --no-backup) BACKUP_ENABLED=0; shift ;;
-            --threshold=*) THRESHOLD="${1#*=}"; shift ;;
-            --max-delete=*) MAX_DELETE_PER_RUN="${1#*=}"; shift ;;
-            --min-files=*) MIN_FILE_COUNT="${1#*=}"; shift ;;
-            --directory=*) DIRECTORY="${1#*=}"; shift ;;
+            --backup) BACKUP_ENABLED=1; ARG_BACKUP_SET=1; shift ;;
+            --no-backup) BACKUP_ENABLED=0; ARG_BACKUP_SET=1; shift ;;
+            --threshold=*) THRESHOLD="${1#*=}"; ARG_THRESHOLD_SET=1; shift ;;
+            --max-delete=*) MAX_DELETE_PER_RUN="${1#*=}"; ARG_MAX_DELETE_SET=1; shift ;;
+            --min-files=*) MIN_FILE_COUNT="${1#*=}"; ARG_MIN_FILES_SET=1; shift ;;
+            --directory=*) DIRECTORY="${1#*=}"; ARG_DIRECTORY_SET=1; shift ;;
             --age-days=*) 
                 ENABLE_AGE_BASED_CLEANUP=1
                 FILE_AGE_DAYS="${1#*=}"
@@ -679,7 +733,7 @@ parse_arguments() {
                 CONFIG_FILE="${1#*=}"
                 shift ;;
             --no-log-rotate)
-                AUTO_ROTATE_LOG=0
+                AUTO_ROTATE_LOG=0; ARG_LOG_ROTATE_SET=1
                 shift ;;
             --quiet) 
                 # Redefine print_to_terminal untuk quiet mode
@@ -871,7 +925,7 @@ execute_cleanup() {
             else
                 errors=$((errors + 1))
             fi
-        fi
+        fi  # TAMBAHKAN 'fi' YANG HILANG INI
     done < "$TEMP_DELETE_LIST"
 
     print_to_terminal "Total diproses: $count file. Error: $errors" "INFO"
@@ -900,13 +954,9 @@ main() {
     print_to_terminal "Log File: $LOG_FILE (Max: ${MAX_LOG_SIZE_MB}MB)" "INFO"
     print_to_terminal "=========================================" "HEADER"
     
-    # Start time untuk menghitung duration
-    local START_TIME
-    START_TIME=$(date +%s)
-    print_to_terminal "Start Time (Unix timestamp): $START_TIME" "DEBUG"
-    
-    # Cek kompatibilitas RHEL 9
-    check_rhel9_compatibility
+    # Parse arguments FIRST
+    print_to_terminal "STEP 1: Parsing command line arguments..." "INFO"
+    parse_arguments "$@"
     
     # Setup directories
     mkdir -p "/var/log/cdr-cleanup" 2>/dev/null || {
@@ -916,10 +966,16 @@ main() {
     
     mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
     
-    parse_arguments "$@"
-    
     # Load configuration
     load_config
+    
+    # Start time untuk menghitung duration
+    local START_TIME
+    START_TIME=$(date +%s)
+    print_to_terminal "Start Time (Unix timestamp): $START_TIME" "DEBUG"
+    
+    # Cek kompatibilitas RHEL 9
+    check_rhel9_compatibility
     
     # Check and rotate log if needed (sebelum validasi lain)
     print_to_terminal "Checking log file size..." "INFO"
@@ -936,10 +992,30 @@ main() {
         exit 1
     fi
     
+    # VALIDASI MAX_DELETE_PER_RUN
     if [[ "$MAX_DELETE_PER_RUN" -lt 1 ]]; then
         print_to_terminal "Error: MAX_DELETE_PER_RUN minimal 1" "ERROR"
         exit 1
     fi
+    
+    if [[ "$MAX_DELETE_PER_RUN" -gt 10000 ]]; then
+        print_to_terminal "Warning: MAX_DELETE_PER_RUN ($MAX_DELETE_PER_RUN) sangat besar, mungkin tidak aman" "WARNING"
+        if [[ "$DRY_RUN" -eq 0 ]] && [[ -t 0 ]]; then
+            read -p "Lanjutkan dengan MAX_DELETE=$MAX_DELETE_PER_RUN? (y/N): " -n 1 -r
+            echo
+            [[ ! $REPLY =~ ^[Yy]$ ]] && exit 0
+        fi
+    fi
+    
+    # Debug: Tampilkan nilai akhir
+    print_to_terminal "Final Configuration Values:" "INFO"
+    print_to_terminal "  MAX_DELETE_PER_RUN: $MAX_DELETE_PER_RUN" "INFO"
+    print_to_terminal "  DIRECTORY: $DIRECTORY" "INFO"
+    print_to_terminal "  THRESHOLD: $THRESHOLD" "INFO"
+    print_to_terminal "  MIN_FILE_COUNT: $MIN_FILE_COUNT" "INFO"
+    print_to_terminal "  BACKUP_ENABLED: $BACKUP_ENABLED" "INFO"
+    print_to_terminal "  FILE_AGE_DAYS: $FILE_AGE_DAYS" "INFO"
+    print_to_terminal "  ENABLE_AGE_BASED_CLEANUP: $ENABLE_AGE_BASED_CLEANUP" "INFO"
     
     # Cleanup old logs
     cleanup_old_logs
@@ -947,27 +1023,6 @@ main() {
     # Validasi directory
     validate_directory "$DIRECTORY"
     check_security_files "$DIRECTORY"
-    
-    # Lock file untuk mencegah multiple execution
-    if ! ( set -o noclobber; echo "$$" > "$LOCK_FILE" ) 2>/dev/null; then
-        if [[ -f "$LOCK_FILE" ]]; then
-            local pid=$(cat "$LOCK_FILE" 2>/dev/null)
-            if kill -0 "$pid" 2>/dev/null; then
-                print_to_terminal "Script sudah berjalan dengan PID: $pid" "ERROR"
-                print_to_terminal "Exiting..." "INFO"
-                exit 0
-            else
-                # Stale lock file
-                rm -f "$LOCK_FILE"
-                echo "$$" > "$LOCK_FILE"
-                print_to_terminal "Cleaned stale lock file, proceeding..." "WARNING"
-            fi
-        fi
-    fi
-    
-    # Tambah trap untuk cleanup lock file
-    trap 'rm -f "$LOCK_FILE" 2>/dev/null' EXIT
-    print_to_terminal "Lock file created: $LOCK_FILE" "DEBUG"
     
     # Test disk usage
     print_to_terminal "Testing disk usage for directory: $DIRECTORY" "DEBUG"
@@ -1063,6 +1118,8 @@ main() {
     print_to_terminal "Debug Mode: $([ "$DEBUG_MODE" -eq 1 ] && echo "YES" || echo "NO")" "INFO"
     print_to_terminal "Include Hidden: $([ "$INCLUDE_HIDDEN" -eq 1 ] && echo "YES" || echo "NO")" "INFO"
     print_to_terminal "Auto Log Rotation: $([ "$AUTO_ROTATE_LOG" -eq 1 ] && echo "YES" || echo "NO")" "INFO"
+    print_to_terminal "Max Delete Per Run: $MAX_DELETE_PER_RUN" "INFO"
+    print_to_terminal "Min Files Per Dir: $MIN_FILE_COUNT" "INFO"
     
     # Log file info
     if [[ -f "$LOG_FILE" ]]; then
