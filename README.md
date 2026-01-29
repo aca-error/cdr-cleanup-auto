@@ -1,31 +1,16 @@
-**Log File Structure:**
+CDR CLEANUP UTILITY
+===================
 
-/home/cdrsbx/cleanup.log    
-├── START LOG (Timestamp, PID, Arguments)    
-├── CONFIGURATION (Settings)    
-├── PROCESS STEPS (Find, Filter, Delete)    
-├── END LOG (Duration, Summary)    
-└── ERROR/WARNING MESSAGES    
+Quick Start:
+- Test: cdr-cleanup --help
+- Dry run: cdr-cleanup --threshold=85 --dry-run
+- Actual: cdr-cleanup --force --threshold=80
 
+Files:
+- Config: /etc/cdr-cleanup.conf
+- Logs: /var/log/cdr-cleanup/
+- Man page: man cdr-cleanup
 
-**File Structure:**    
-/
-├── etc/
-│   ├── cdr-cleanup.conf              # Main config
-│   ├── logrotate.d/
-│   │   └── cdr-cleanup               # Logrotate config
-│   └── systemd/system/
-│       ├── cdr-cleanup.service       # Systemd service
-│       └── cdr-cleanup.timer         # Systemd timer
-├── usr/
-│   └── local/
-│       ├── bin/cdr-cleanup           # Main script
-│       └── share/man/man1/
-│           └── cdr-cleanup.1.gz      # Man page
-├── var/
-│   ├── log/cdr-cleanup/              # Log directory
-│   │   └── cdr-cleanup.log           # Current log
-│   └── lock/cdr-cleanup.lock         # Lock file
-└── home/
-    ├── cdrsbx/                       # Default target
-    └── backup/deleted_files/         # Backup directory
+Scheduling:
+systemctl enable cdr-cleanup.timer
+systemctl start cdr-cleanup.timer
