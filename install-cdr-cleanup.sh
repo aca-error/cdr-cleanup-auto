@@ -4,9 +4,9 @@ set -o errexit -o nounset -o pipefail
 # ============================================
 # CONFIGURATION
 # ============================================
-SCRIPT_NAME="install-cdr-full.sh"
+SCRIPT_NAME="install-cdr-cleanup.sh"
 VERSION="4.0"
-AUTHOR="CDR Management Team"
+AUTHOR="aca-error"
 
 # Main script (harus ada di direktori yang sama)
 MAIN_SCRIPT_NAME="cdr-cleanup"
